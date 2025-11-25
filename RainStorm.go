@@ -1,42 +1,24 @@
 package main
 
-
 import (
-	hydfs "g51mp4/hydfs_system"
+	//hydfs "g51mp4/hydfs_system"
 	"bufio"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net"
 	"net/rpc"
 	"os/exec"
+	"strings"
 	"sync"
+
+	rss "g51mp4/RainStormStructs"
 )
 
 // --------------------------
 // Task structures
 // --------------------------
-
-type Tuple struct {
-	Key   string
-	Value string
-}
-
-type AssignTaskArgs struct {
-	TaskID int
-	Stage  int
-	Exe    string
-	Args   []string
-}
-
-type AddTuplesArgs struct {
-	TaskID int
-	Tuples []Tuple
-}
-
-type KillTaskArgs struct {
-	TaskID int
-}
 
 type TaskState struct {
 	ID     int
@@ -44,6 +26,7 @@ type TaskState struct {
 	Cmd    *exec.Cmd
 	Stdin  io.WriteCloser
 	Stdout io.ReadCloser
+	Downstream []rss.DownstreamInfo // IP:port of next stage task
 }
 
 // --------------------------
@@ -59,7 +42,37 @@ var tasksMu sync.Mutex
 
 type Worker struct{}
 
-func (w *Worker) AssignTask(args *AssignTaskArgs, reply *bool) error {
+func HashKey(key string) uint32 {
+    h := fnv.New32a()
+    h.Write([]byte(key))
+    return h.Sum32()
+}
+
+func parseTuple(line string) rss.Tuple {
+    parts := strings.SplitN(line, "\t", 2) // split into at most 2 parts
+    if len(parts) < 2 {
+        return rss.Tuple{
+            Key:   line,
+            Value: "",
+        }
+    }
+    return rss.Tuple{
+        Key:   parts[0],
+        Value: parts[1],
+    }
+}
+
+func sendRPC(addr string, method string, args interface{}, reply interface{}) error {
+    client, err := rpc.Dial("tcp", addr+":9300")
+    if err != nil {
+        return err
+    }
+    defer client.Close()
+    return client.Call(method, args, reply)
+}
+
+
+func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 	tasksMu.Lock()
 	defer tasksMu.Unlock()
 
@@ -84,25 +97,54 @@ func (w *Worker) AssignTask(args *AssignTaskArgs, reply *bool) error {
 		Cmd:    cmd,
 		Stdin:  stdin,
 		Stdout: stdout,
+		Downstream: args.Downstream,
 	}
 
 	tasks[args.TaskID] = ts
 
 	// Start goroutine to read task output
 	go func() {
-		scanner := bufio.NewScanner(ts.Stdout)
-		for scanner.Scan() {
-			line := scanner.Text()
-			// TODO: send this line back to leader
-			fmt.Printf("[Task %d Output] %s\n", ts.ID, line)
+    scanner := bufio.NewScanner(ts.Stdout)
+    for scanner.Scan() {
+        line := scanner.Text()
+
+        tuple := parseTuple(line)
+
+        idx := int(HashKey(tuple.Key)) % len(ts.Downstream)
+        target := ts.Downstream[idx]
+
+        // forward
+        for {
+			var dummyReply bool
+			err := sendRPC(target.IP, "Worker.AddTuples",
+				&rss.AddTuplesArgs{
+					TaskID: target.TaskID,
+					Tuples: []rss.Tuple{tuple},
+				},
+				&dummyReply,
+			)
+			if err == nil {
+				break // success, move on to next tuple
+			}
+
+			// RPC failed → notify leader
+			//notifyLeaderTaskFailed(ts.ID)
+
+			// wait for leader to push new downstream info
+			//time.Sleep(100 * time.Millisecond)
+			//idx := int(HashKey(tuple.Key)) % len(ts.Downstream) // recompute new target				//NEED TO DEAL WITH TASK FAILURE + RPC FAILURE (SCANNER FAILS)
+			//target = ts.Downstream[idx]
 		}
-	}()
+
+    }
+}()
+
 
 	*reply = true
 	return nil
 }
 
-func (w *Worker) AddTuples(args *AddTuplesArgs, reply *bool) error {
+func (w *Worker) AddTuples(args *rss.AddTuplesArgs, reply *bool) error {
 	tasksMu.Lock()
 	ts, ok := tasks[args.TaskID]
 	tasksMu.Unlock()
@@ -111,14 +153,25 @@ func (w *Worker) AddTuples(args *AddTuplesArgs, reply *bool) error {
 	}
 
 	for _, t := range args.Tuples {
-		fmt.Fprintf(ts.Stdin, "%s %s\n", t.Key, t.Value)
+		// compute which downstream index this tuple would go to
+		idx := int(HashKey(t.Key)) % len(ts.Downstream)
+		if ts.Downstream[idx].TaskID != args.TaskID {
+			// tuple does not belong to this task
+			// placeholder: log error or return error
+			log.Printf("Tuple with key %s does not belong to task %d", t.Key, args.TaskID)
+			continue // skip or return error
+		}
+
+		// tuple is correct, write to stdin
+		fmt.Fprintf(ts.Stdin, "%s\t%s\n", t.Key, t.Value)
 	}
 
 	*reply = true
 	return nil
 }
 
-func (w *Worker) KillTask(args *KillTaskArgs, reply *bool) error {
+
+func (w *Worker) KillTask(args *rss.KillTaskArgs, reply *bool) error {
 	tasksMu.Lock()
 	ts, ok := tasks[args.TaskID]
 	if ok {
@@ -137,13 +190,28 @@ func (w *Worker) KillTask(args *KillTaskArgs, reply *bool) error {
 	return nil
 }
 
+func getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		log.Fatal("Error getting addresses:", err)
+	}
+
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil && !ipnet.IP.IsLoopback() {
+			return ipnet.IP.String()
+		}
+	}
+	return ""
+}
+
+
 // --------------------------
 // Main RPC listener
 // --------------------------
 
 func main() {
 	
-	hydfs.Start()
+	ip := getLocalIP()
 
 
 	port := "9300" // Or read from command-line arguments
@@ -151,7 +219,7 @@ func main() {
 	worker := &Worker{}
 	rpc.Register(worker)
 
-	ln, err := net.Listen("tcp", ":"+port)
+	ln, err := net.Listen("tcp", ip+":"+port)
 	if err != nil {
 		log.Fatal(err)
 	}
