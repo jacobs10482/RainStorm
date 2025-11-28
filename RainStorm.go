@@ -204,7 +204,10 @@ func getLocalIP() string {
 	return ""
 }
 
-
+func (w *Worker) Heartbeat(_ *struct{}, reply *bool) error {
+    *reply = true
+    return nil
+}
 // --------------------------
 // Main RPC listener
 // --------------------------

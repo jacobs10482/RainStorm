@@ -1,13 +1,49 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	rss "g51mp4/RainStormStructs"
 	"log"
 	"net"
 	"net/rpc"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
-	rss "g51mp4/RainStormStructs"
 )
+
+var vmMapRPC = map[string]string{
+    "vm1":  "172.22.95.98:9200",
+    "vm2":  "172.22.154.169:9200",
+    "vm3":  "172.22.158.169:9200",
+    "vm4":  "172.22.95.99:9200",
+    "vm5":  "172.22.154.170:9200",
+    "vm6":  "172.22.158.170:9200",
+    "vm7":  "172.22.95.100:9200",
+    "vm8":  "172.22.154.171:9200",
+    "vm9":  "172.22.158.171:9200",
+    "vm10": "172.22.95.101:9200",
+}
+
+type RainStormCommand struct {
+	Nstages         int
+	NtasksPerStage  int
+	Ops             []StageOp
+	HydfsSrc        string
+	HydfsDest       string
+	ExactlyOnce     bool
+	Autoscale       bool
+	InputRate       int
+	LW              int
+	HW              int
+}
+
+type StageOp struct {
+	Exe  string
+	Args string
+}
+
 
 // --------------------------
 // Leader structures
@@ -21,25 +57,23 @@ type AssignTaskArgs struct {
 }
 
 
-type WorkerInfo struct {
-	Address string // worker RPC address
-	Alive   bool
-}
-
 // --------------------------
 // Leader state
 // --------------------------
 
 type Leader struct {
-	mu          sync.Mutex
-	workers     map[string]*WorkerInfo       // worker address → info
-	taskMapping map[int]string               // taskID → worker address
-	tupleBuffer map[int][]rss.Tuple              // taskID → tuples in-flight
+    mu          sync.Mutex
+    workers     []string    // set of alive workers
+    taskMapping map[int]string         // taskID → worker addr
+    tupleBuffer map[int][]rss.Tuple
 }
+
+
 
 // --------------------------
 // RPC Methods for workers
 // --------------------------
+
 
 
 func (l *Leader) TaskFailed(args *rss.KillTaskArgs, reply *bool) error {
@@ -61,13 +95,12 @@ func (l *Leader) TaskFailed(args *rss.KillTaskArgs, reply *bool) error {
 	delete(l.tupleBuffer, args.TaskID)
 
 	// Reassign task to a new worker (simplest: first alive worker)
-	for addr, w := range l.workers {
-		if w.Alive {
-			log.Printf("Reassigning task %d to worker %s\n", args.TaskID, addr)
-			go l.sendTask(addr, args.TaskID, tuples)
-			break
-		}
+	for _, addr := range l.workers {
+		log.Printf("Reassigning task %d to worker %s\n", args.TaskID, addr)
+		go l.sendTask(addr, args.TaskID, tuples)
+		break
 	}
+
 
 	*reply = true
 	return nil
@@ -116,33 +149,168 @@ func (l *Leader) sendTask(workerAddr string, taskID int, tuples []rss.Tuple) {
 	l.mu.Unlock()
 }
 
+func discoverWorkers() []string {
+    live := []string{}
+    for _, addr := range vmMapRPC {
+        if pingWorker(addr) {
+            live = append(live, addr)
+        }
+    }
+    return live
+}
+
+func pingWorker(addr string) bool {
+    client, err := rpc.Dial("tcp", addr)
+    if err != nil {
+        return false
+    }
+    defer client.Close()
+
+    var ok bool
+    callErr := client.Call("Worker.Heartbeat", &struct{}{}, &ok)
+    return callErr == nil && ok
+}
+
+
+
+func parseRainStormCommand(line string) (*RainStormCommand, error) {
+	parts := strings.Fields(line)
+	if len(parts) < 7 { // minimal check
+		return nil, fmt.Errorf("not enough arguments")
+	}
+
+	if parts[0] != "RainStorm" {
+		return nil, fmt.Errorf("command must start with 'RainStorm'")
+	}
+
+	// Parse stages and tasks
+	nStages, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid Nstages: %v", err)
+	}
+
+	nTasks, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("invalid Ntasks_per_stage: %v", err)
+	}
+
+	if len(parts) < 3+2*nStages+5 { // 2 per stage + hydfs src/dest + exactly_once + autoscale + 3 optional
+		return nil, fmt.Errorf("not enough arguments for stages and parameters")
+	}
+
+	ops := make([]StageOp, nStages)
+	for i := 0; i < nStages; i++ {
+		exe := parts[3+i*2]
+		arg := parts[3+i*2+1]
+		// remove quotes if present
+		arg = strings.Trim(arg, "\"")
+		ops[i] = StageOp{
+			Exe:  exe,
+			Args: arg,
+		}
+	}
+
+	offset := 3 + 2*nStages
+	hydfsSrc := parts[offset]
+	hydfsDest := parts[offset+1]
+
+	exactlyOnce, err := strconv.ParseBool(parts[offset+2])
+	if err != nil {
+		return nil, fmt.Errorf("invalid exactly_once: %v", err)
+	}
+
+	autoscale, err := strconv.ParseBool(parts[offset+3])
+	if err != nil {
+		return nil, fmt.Errorf("invalid autoscale_enabled: %v", err)
+	}
+
+	inputRate, lw, hw := 0, 0, 0
+	if autoscale {
+		inputRate, err = strconv.Atoi(parts[offset+4])
+		if err != nil {
+			return nil, fmt.Errorf("invalid INPUT_RATE: %v", err)
+		}
+		lw, err = strconv.Atoi(parts[offset+5])
+		if err != nil {
+			return nil, fmt.Errorf("invalid LW: %v", err)
+		}
+		hw, err = strconv.Atoi(parts[offset+6])
+		if err != nil {
+			return nil, fmt.Errorf("invalid HW: %v", err)
+		}
+	}
+
+	return &RainStormCommand{
+		Nstages:        nStages,
+		NtasksPerStage: nTasks,
+		Ops:            ops,
+		HydfsSrc:       hydfsSrc,
+		HydfsDest:      hydfsDest,
+		ExactlyOnce:    exactlyOnce,
+		Autoscale:      autoscale,
+		InputRate:      inputRate,
+		LW:             lw,
+		HW:             hw,
+	}, nil
+}
+
+
 // --------------------------
 // Main
 // --------------------------
 
 func main() {
 	leader := &Leader{
-		workers:     make(map[string]*WorkerInfo),
-		taskMapping: make(map[int]string),
-		tupleBuffer: make(map[int][]rss.Tuple),
+		workers:     discoverWorkers(),         // list of available VMs
+		taskMapping: make(map[int]string),      // taskID → worker
+		tupleBuffer: make(map[int][]rss.Tuple), // in-flight tuples
 	}
 
-	// Example: register two workers
-	leader.workers["127.0.0.1:9300"] = &WorkerInfo{Address: "127.0.0.1:9300", Alive: true}
-	leader.workers["127.0.0.1:9301"] = &WorkerInfo{Address: "127.0.0.1:9301", Alive: true}
-
+	// Register leader RPC
 	rpc.Register(leader)
-	ln, err := net.Listen("tcp", ":9400") // leader port
+
+	// Start listening for RPC connections
+	ln, err := net.Listen("tcp", ":9300") // leader port
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Println("Leader RPC listening on port 9400")
+	log.Println("Leader RPC listening on port 9300")
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
+	// RPC listener in its own goroutine
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				continue
+			}
+			go rpc.ServeConn(conn)
+		}
+	}()
+
+	// CLI input loop in main goroutine
+	scanner := bufio.NewScanner(os.Stdin)
+	fmt.Println("Leader ready. Enter RainStorm command:")
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
 			continue
 		}
-		go rpc.ServeConn(conn)
+
+		cmd, err := parseRainStormCommand(line)
+		if err != nil {
+			fmt.Println("Error parsing command:", err)
+			continue
+		}
+
+		fmt.Printf("Parsed command: %+v\n", cmd)
+
+		// TODO: pass cmd to RainStorm start logic
+		fmt.Println("Command processed. Enter next command:")
 	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "Error reading input:", err)
+	}
+
 }
