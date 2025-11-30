@@ -12,7 +12,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-
+	//hydfs "g51mp4/hydfs_system"
 	rss "g51mp4/RainStormStructs"
 )
 
@@ -42,6 +42,19 @@ var tasksMu sync.Mutex
 
 type Worker struct{}
 
+
+
+func sendRPC(addr string, method string, args interface{}, reply interface{}) error {
+    client, err := rpc.Dial("tcp", addr+":9300")
+    if err != nil {
+        return err
+    }
+    defer client.Close()
+    return client.Call(method, args, reply)
+}
+
+
+
 func HashKey(key string) uint32 {
     h := fnv.New32a()
     h.Write([]byte(key))
@@ -62,21 +75,19 @@ func parseTuple(line string) rss.Tuple {
     }
 }
 
-func sendRPC(addr string, method string, args interface{}, reply interface{}) error {
-    client, err := rpc.Dial("tcp", addr+":9300")
-    if err != nil {
-        return err
-    }
-    defer client.Close()
-    return client.Call(method, args, reply)
-}
+
 
 
 func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 	tasksMu.Lock()
 	defer tasksMu.Unlock()
 
-	cmd := exec.Command(args.Exe, args.Args...)
+	argList := []string{}
+	if strings.TrimSpace(args.Args) != "" {
+		argList = strings.Fields(args.Args)
+	}
+
+	cmd := exec.Command(args.Exe, argList...)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -115,6 +126,7 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 
         // forward
         for {
+			
 			var dummyReply bool
 			err := sendRPC(target.IP, "Worker.AddTuples",
 				&rss.AddTuplesArgs{

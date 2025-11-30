@@ -1227,7 +1227,7 @@ func drainChannel(ch chan string) {
 }
 
 // Start initializes and starts the HyDFS system
-func Start() {
+func Start() *fd.Node {
 	node := fd.InitializeFailureDetection()
 
 	hyDFSPath, err := initHyDFSDir()
@@ -1255,7 +1255,5 @@ func Start() {
 		}
 	}()
 
-	StdinListener(node)
-
-	select {}
+	return node
 }

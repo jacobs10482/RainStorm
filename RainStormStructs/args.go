@@ -1,5 +1,15 @@
 package rainstormrpc
 
+import "hash/fnv"
+
+
+func HashKey(key string) uint32 {
+    h := fnv.New32a()
+    h.Write([]byte(key))
+    return h.Sum32()
+}
+
+
 type Tuple struct {
     Key   string
     Value string
@@ -9,7 +19,7 @@ type AssignTaskArgs struct {
     TaskID        int
     Stage         int
     Exe           string
-    Args          []string
+    Args          string
     Downstream []DownstreamInfo
 }
 

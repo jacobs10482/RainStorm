@@ -11,7 +11,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	fd "g51mp4/failure_detection"
+	hydfs "g51mp4/hydfs_system"
 )
+
+var node *fd.Node
+
 
 var vmMapRPC = map[string]string{
     "vm1":  "172.22.95.98:9200",
@@ -74,6 +79,16 @@ type Leader struct {
 // RPC Methods for workers
 // --------------------------
 
+
+
+func sendRPC(addr string, method string, args interface{}, reply interface{}) error {
+    client, err := rpc.Dial("tcp", addr+":9300")
+    if err != nil {
+        return err
+    }
+    defer client.Close()
+    return client.Call(method, args, reply)
+}
 
 
 func (l *Leader) TaskFailed(args *rss.KillTaskArgs, reply *bool) error {
@@ -254,12 +269,130 @@ func parseRainStormCommand(line string) (*RainStormCommand, error) {
 	}, nil
 }
 
+func taskID(stage int, index int, tasksPerStage int) int {
+    return stage * tasksPerStage + index
+}
+
+
+func (l *Leader) assignAllTasks(cmd *RainStormCommand) error {
+    workers := l.workers
+    if len(workers) == 0 {
+        return fmt.Errorf("no workers available")
+    }
+
+    wcount := len(workers)
+    tps := cmd.NtasksPerStage
+
+    // Precompute worker assignment for every task
+    taskToWorker := make(map[int]string)
+
+    for stage := 0; stage < cmd.Nstages; stage++ {
+        for i := 0; i < tps; i++ {
+            tid := taskID(stage, i, tps)
+            worker := workers[tid % wcount]  // round-robin
+            taskToWorker[tid] = worker
+        }
+    }
+
+    // Now send AssignTask RPC for each task
+    for stage := 0; stage < cmd.Nstages; stage++ {
+        for i := 0; i < tps; i++ {
+            tid := taskID(stage, i, tps)
+            worker := taskToWorker[tid]
+
+            // Build downstream list
+            var downstream []rss.DownstreamInfo
+            if stage < cmd.Nstages-1 {
+                nextStage := stage + 1
+                for j := 0; j < tps; j++ {
+                    dtid := taskID(nextStage, j, tps)
+                    downstream = append(downstream, rss.DownstreamInfo{
+                        IP:     taskToWorker[dtid],
+                        TaskID: dtid,
+                    })
+                }
+            }
+
+            // Build RPC args
+            args := &rss.AssignTaskArgs{
+                TaskID:    tid,
+                Stage:     stage,
+                Exe:       cmd.Ops[stage].Exe,
+                Args:      cmd.Ops[stage].Args,
+                Downstream: downstream,
+            }
+
+            // Perform RPC
+            var reply bool
+            if err := sendRPC(worker, "Worker.AssignTask", args, &reply); err != nil {
+                return fmt.Errorf("assigning task %d to %s failed: %v", tid, worker, err)
+            }
+
+            // Save mapping
+            l.taskMapping[tid] = worker
+        }
+    }
+
+    return nil
+}
+
+func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int) error {
+    file, err := os.Open(filename)
+    if err != nil {
+        return fmt.Errorf("failed to open file %s: %v", filename, err)
+    }
+    defer file.Close()
+
+    scanner := bufio.NewScanner(file)
+    lineNum := 0
+    for scanner.Scan() {
+        line := scanner.Text()
+        key := fmt.Sprintf("%s:%d", filename, lineNum)
+        tuple := rss.Tuple{
+            Key:   key,
+            Value: line,
+        }
+
+        // Hash key to pick stage 1 task
+        taskIdx := int(rss.HashKey(tuple.Key)) % nTasksStage1
+        taskID := taskID(0, taskIdx, nTasksStage1) // assuming stage 0 = first stage
+        workerAddr, ok := l.taskMapping[taskID]
+        if !ok {
+            return fmt.Errorf("no worker assigned for task %d", taskID)
+        }
+
+        // Send the tuple via RPC
+        args := rss.AddTuplesArgs{
+            TaskID: taskID,
+            Tuples: []rss.Tuple{tuple},
+        }
+        var reply bool
+        if err := sendRPC(workerAddr, "Worker.AddTuples", &args, &reply); err != nil {
+            log.Printf("failed to send tuple to worker %s task %d: %v", workerAddr, taskID, err)
+            // optionally buffer for retry
+        }
+
+        lineNum++
+    }
+
+    if err := scanner.Err(); err != nil {
+        return fmt.Errorf("error reading file %s: %v", filename, err)
+    }
+
+    return nil
+}
+
+
+
 
 // --------------------------
 // Main
 // --------------------------
 
 func main() {
+
+	node = hydfs.Start()
+
 	leader := &Leader{
 		workers:     discoverWorkers(),         // list of available VMs
 		taskMapping: make(map[int]string),      // taskID → worker
@@ -304,6 +437,10 @@ func main() {
 		}
 
 		fmt.Printf("Parsed command: %+v\n", cmd)
+
+		leader.assignAllTasks(cmd)
+
+
 
 		// TODO: pass cmd to RainStorm start logic
 		fmt.Println("Command processed. Enter next command:")
