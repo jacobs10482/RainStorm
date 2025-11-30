@@ -1,7 +1,6 @@
 package main
 
 import (
-	//hydfs "g51mp4/hydfs_system"
 	"bufio"
 	"fmt"
 	"hash/fnv"
@@ -12,9 +11,12 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	//hydfs "g51mp4/hydfs_system"
 	rss "g51mp4/RainStormStructs"
+	fd "g51mp4/failure_detection"
+	hydfs "g51mp4/hydfs_system"
 )
+
+var node *fd.Node
 
 // --------------------------
 // Task structures
@@ -121,6 +123,15 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 
         tuple := parseTuple(line)
 
+		if len(ts.Downstream) == 0 {
+			// For now: print key/value to terminal
+			fmt.Printf("%s\t%s\n", tuple.Key, tuple.Value)
+
+			// Eventually: write to hydfs through your Node API.
+			return
+		}
+
+
         idx := int(HashKey(tuple.Key)) % len(ts.Downstream)
         target := ts.Downstream[idx]
 
@@ -138,7 +149,7 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 			if err == nil {
 				break // success, move on to next tuple
 			}
-
+			
 			// RPC failed → notify leader
 			//notifyLeaderTaskFailed(ts.ID)
 
@@ -226,6 +237,8 @@ func (w *Worker) Heartbeat(_ *struct{}, reply *bool) error {
 
 func main() {
 	
+	node = hydfs.Start()
+
 	ip := getLocalIP()
 
 

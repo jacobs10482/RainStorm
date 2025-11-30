@@ -20,6 +20,7 @@ type AssignTaskArgs struct {
     Stage         int
     Exe           string
     Args          string
+    Dest          string
     Downstream []DownstreamInfo
 }
 

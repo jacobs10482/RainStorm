@@ -317,6 +317,7 @@ func (l *Leader) assignAllTasks(cmd *RainStormCommand) error {
             args := &rss.AssignTaskArgs{
                 TaskID:    tid,
                 Stage:     stage,
+				Dest:      cmd.HydfsDest,
                 Exe:       cmd.Ops[stage].Exe,
                 Args:      cmd.Ops[stage].Args,
                 Downstream: downstream,
@@ -393,6 +394,8 @@ func main() {
 
 	node = hydfs.Start()
 
+
+	
 	leader := &Leader{
 		workers:     discoverWorkers(),         // list of available VMs
 		taskMapping: make(map[int]string),      // taskID → worker
@@ -438,6 +441,7 @@ func main() {
 
 		fmt.Printf("Parsed command: %+v\n", cmd)
 
+		hydfs.HandleCreate(node, "emptyfile.txt", cmd.HydfsDest)
 		leader.assignAllTasks(cmd)
 
 

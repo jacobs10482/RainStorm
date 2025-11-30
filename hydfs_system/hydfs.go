@@ -521,7 +521,7 @@ func getReplicas(node *fd.Node, key string, replicationFactor int) []string {
 
 // MultiAppend handles the multiappend RPC call
 func (n *NodeRPC) MultiAppend(args MultiAppendArgs, reply *MultiAppendReply) error {
-	handleAppend(n.node, args.LocalFile, args.HydfsFile)
+	HandleAppend(n.node, args.LocalFile, args.HydfsFile)
 	reply.Success = true
 	reply.Message = fmt.Sprintf("Ran append on %s", n.node.ID)
 	return nil
@@ -543,8 +543,8 @@ func getRPCAddrFromNodeID(nodeID string) string {
 	return net.JoinHostPort(host, "9200")
 }
 
-// handleCreate creates a new file on all replicas
-func handleCreate(node *fd.Node, localFile, hydfsFile string) {
+// HandleCreate creates a new file on all replicas
+func HandleCreate(node *fd.Node, localFile, hydfsFile string) {
 	// 1. Check if local file exists
 	data, err := os.ReadFile(localFile)
 	if err != nil {
@@ -602,8 +602,8 @@ func handleCreate(node *fd.Node, localFile, hydfsFile string) {
 	}
 }
 
-// handleAppend appends data to all replicas of a given HyDFS file
-func handleAppend(node *fd.Node, localFile, hydfsFile string) {
+// HandleAppend appends data to all replicas of a given HyDFS file
+func HandleAppend(node *fd.Node, localFile, hydfsFile string) {
 	// Read data from local file
 	data, err := os.ReadFile(localFile)
 	if err != nil {
@@ -1037,7 +1037,7 @@ func StdinListener(node *fd.Node) {
 			localFile := args[1]
 			hyDFSFile := args[2]
 			fmt.Printf("[create] %s -> %s\n", localFile, hyDFSFile)
-			handleCreate(node, localFile, hyDFSFile)
+			HandleCreate(node, localFile, hyDFSFile)
 
 			// TODO: call your create handler
 
@@ -1061,7 +1061,7 @@ func StdinListener(node *fd.Node) {
 			localFile := args[1]
 			hyDFSFile := args[2]
 			fmt.Printf("[append] %s -> %s\n", localFile, hyDFSFile)
-			handleAppend(node, localFile, hyDFSFile)
+			HandleAppend(node, localFile, hyDFSFile)
 
 		case "merge":
 			if len(args) != 2 {
