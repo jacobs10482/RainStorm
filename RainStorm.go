@@ -14,6 +14,7 @@ import (
 	rss "g51mp4/RainStormStructs"
 	fd "g51mp4/failure_detection"
 	hydfs "g51mp4/hydfs_system"
+	"os"
 )
 
 var node *fd.Node
@@ -25,6 +26,8 @@ var node *fd.Node
 type TaskState struct {
 	ID     int
 	Stage  int
+	HydfsDest   string
+	LastStageOutputFile string
 	Cmd    *exec.Cmd
 	Stdin  io.WriteCloser
 	Stdout io.ReadCloser
@@ -108,9 +111,11 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 		ID:     args.TaskID,
 		Stage:  args.Stage,
 		Cmd:    cmd,
+		HydfsDest:   args.Dest,
 		Stdin:  stdin,
 		Stdout: stdout,
 		Downstream: args.Downstream,
+		LastStageOutputFile: fmt.Sprintf("last_stage_output_%d.txt", args.TaskID),
 	}
 
 	tasks[args.TaskID] = ts
@@ -128,7 +133,11 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 			fmt.Printf("%s\t%s\n", tuple.Key, tuple.Value)
 
 			// Eventually: write to hydfs through your Node API.
-			return
+			lineOutput := fmt.Sprintf("%s\t%s\n", tuple.Key, tuple.Value)
+			os.WriteFile(ts.LastStageOutputFile, []byte(lineOutput), 0644)
+			hydfs.HandleAppend(node, ts.LastStageOutputFile, ts.HydfsDest)
+			os.WriteFile(ts.LastStageOutputFile, []byte{}, 0644)
+			continue
 		}
 
 
