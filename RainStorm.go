@@ -304,7 +304,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Println("Worker RPC listening on port", port)
+	fmt.Printf("Worker RPC listening on port %s\n", port)
 
 	for {
 		conn, err := ln.Accept()
