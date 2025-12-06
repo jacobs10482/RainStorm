@@ -456,6 +456,8 @@ func main() {
 		hydfs.HandleCreate(node, "emptyfile.txt", cmd.HydfsDest)
 		leader.assignAllTasks(cmd)
 
+		leader.ReadFileAndSendTuples(cmd.HydfsSrc, cmd.NtasksPerStage)
+
 		fmt.Println("Command processed. Enter next command:")
 	}
 
