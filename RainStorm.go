@@ -84,6 +84,7 @@ func parseTuple(line string) rss.Tuple {
 
 
 func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
+	
 	tasksMu.Lock()
 	defer tasksMu.Unlock()
 
@@ -119,7 +120,7 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 	}
 
 	tasks[args.TaskID] = ts
-
+	fmt.Printf("Assigned task: %s\n", args.Exe)
 	// Start goroutine to read task output
 	go func() {
     scanner := bufio.NewScanner(ts.Stdout)
