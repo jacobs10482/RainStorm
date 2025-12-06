@@ -3,18 +3,19 @@ package main
 import (
 	"bufio"
 	"fmt"
+	rss "g51mp4/RainStormStructs"
+	fd "g51mp4/failure_detection"
+	hydfs "g51mp4/hydfs_system"
 	"hash/fnv"
 	"io"
 	"log"
 	"net"
 	"net/rpc"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
-	rss "g51mp4/RainStormStructs"
-	fd "g51mp4/failure_detection"
-	hydfs "g51mp4/hydfs_system"
-	"os"
+	"time"
 )
 
 var node *fd.Node
@@ -137,9 +138,67 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 
 	// Start goroutine to process tuples
 	go processTuples(ts)
+	go monitorAcks(ts)
 
 	*reply = true
 	return nil
+}
+
+func monitorAcks(ts *TaskState) {
+    ticker := time.NewTicker(100 * time.Millisecond)
+    defer ticker.Stop()
+    
+    for range ticker.C {
+        // Make a copy of unacked tuples to avoid holding lock during RPC
+        unackedTuples := []rss.Tuple{}
+        
+        ts.mu1.RLock()
+        ts.mu2.RLock()
+        for key, tuple := range ts.ProcessedTuples {
+            if _, acked := ts.AckedTuples[key]; !acked {
+                unackedTuples = append(unackedTuples, tuple)
+            }
+        }
+        ts.mu2.RUnlock()
+        ts.mu1.RUnlock()
+        
+        // Now resend without holding locks
+        for _, tuple := range unackedTuples {
+            // Double-check it's still unacked (might have been acked during copy)
+            ts.mu2.RLock()
+            _, acked := ts.AckedTuples[tuple.Key]
+            ts.mu2.RUnlock()
+            
+            if acked {
+                continue // Got acked while we were copying, skip it
+            }
+            
+            log.Printf("Task %d: Tuple %s not acked, resending", ts.ID, tuple.Key)
+            
+            if len(ts.Downstream) == 0 {
+                continue // Final stage, nothing to resend to
+            }
+            
+            idx := int(HashKey(tuple.Key)) % len(ts.Downstream)
+            target := ts.Downstream[idx]
+            
+            var dummyReply bool
+            err := sendRPC(target.IP, "Worker.AddTuples",
+                &rss.AddTuplesArgs{
+                    TaskID:     target.TaskID,
+                    Tuples:     []rss.Tuple{tuple},
+                    SourceIP:   getLocalIP() + ":9300",
+                    SourceTask: ts.ID,
+                },
+                &dummyReply,
+            )
+            
+            if err != nil {
+                log.Printf("Task %d: Failed to resend tuple %s: %v", ts.ID, tuple.Key, err)
+                // Could notify leader of downstream failure here
+            }
+        }
+    }
 }
 
 // Main processing goroutine - reads from queue, processes, acks, and forwards
