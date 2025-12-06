@@ -385,7 +385,19 @@ func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int) error 
     return nil
 }
 
+func getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		log.Fatal("Error getting addresses:", err)
+	}
 
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil && !ipnet.IP.IsLoopback() {
+			return ipnet.IP.String()
+		}
+	}
+	return ""
+}
 
 
 // --------------------------
@@ -393,6 +405,44 @@ func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int) error 
 // --------------------------
 
 func main() {
+	selfIP := getLocalIP()
+	fmt.Println("Local IP:", selfIP)
+
+	// Define the list of known VMs in the cluster
+	vms := []string{
+		"172.22.95.98:9000",
+		"172.22.154.169:9000",
+		"172.22.158.169:9000",
+		"172.22.95.99:9000",
+		"172.22.154.170:9000",
+		"172.22.158.170:9000",
+		"172.22.95.100:9000",
+		"172.22.154.171:9000",
+		"172.22.158.171:9000",
+		"172.22.95.101:9000",
+	}
+
+	// Find the index of this node in the VM list for logging
+	idx := -1
+	for i, v := range vms {
+		if v == (string(selfIP) + ":9000") {
+			idx = i + 1
+			break
+		}
+	}
+
+	// Set up logging to both console and file
+	filename := fmt.Sprintf("machine.%02d.log", idx)
+
+	f, err := os.OpenFile(filename, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+
+	// Create multi-writer to log to both stdout and file
+	//mw := io.MultiWriter(os.Stdout, f)
+	log.SetOutput(f)
 	node := hydfs.Start()
 
 	leader := &Leader{

@@ -531,7 +531,7 @@ func InitializeFailureDetection() *Node {
 		"172.22.158.171:9000",
 		"172.22.95.101:9000",
 	}
-
+/*
 	// Find the index of this node in the VM list for logging
 	idx := -1
 	for i, v := range vms {
@@ -540,19 +540,19 @@ func InitializeFailureDetection() *Node {
 			break
 		}
 	}
-
+*/
 	// Set up logging to both console and file
-	filename := fmt.Sprintf("machine.%02d.log", idx)
+	//filename := fmt.Sprintf("machine.%02d.log", idx)
 
-	f, err := os.OpenFile(filename, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer f.Close()
+	//f, err := os.OpenFile(filename, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+	//if err != nil {
+	//	log.Fatal(err)
+	//}
+	//defer f.Close()
 
 	// Create multi-writer to log to both stdout and file
 	//mw := io.MultiWriter(os.Stdout, f)
-	log.SetOutput(f)
+	//log.SetOutput(f)
 
 	// Create and configure the node
 	node := NewNode(string(selfIP))
