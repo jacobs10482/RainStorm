@@ -50,7 +50,7 @@ type Worker struct{}
 
 
 func sendRPC(addr string, method string, args interface{}, reply interface{}) error {
-    client, err := rpc.Dial("tcp", addr+":9300")
+    client, err := rpc.Dial("tcp", addr)
     if err != nil {
         return err
     }
