@@ -38,6 +38,8 @@ type DownstreamInfo struct {
 type AddTuplesArgs struct {
     TaskID int
     Tuples []Tuple
+    SourceIP   string
+    SourceTask int
 }
 
 type KillTaskArgs struct {

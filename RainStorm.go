@@ -3,266 +3,404 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"hash/fnv"
-	"io"
+	rss "g51mp4/RainStormStructs"
 	"log"
 	"net"
 	"net/rpc"
-	"os/exec"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
-	rss "g51mp4/RainStormStructs"
 	fd "g51mp4/failure_detection"
 	hydfs "g51mp4/hydfs_system"
-	"os"
 )
 
 var node *fd.Node
 
-// --------------------------
-// Task structures
-// --------------------------
+var vmMapRPC = map[string]string{
+	"vm1":  "172.22.95.98:9300",
+	"vm2":  "172.22.154.169:9300",
+	"vm3":  "172.22.158.169:9300",
+	"vm4":  "172.22.95.99:9300",
+	"vm5":  "172.22.154.170:9300",
+	"vm6":  "172.22.158.170:9300",
+	"vm7":  "172.22.95.100:9300",
+	"vm8":  "172.22.154.171:9300",
+	"vm9":  "172.22.158.171:9300",
+	"vm10": "172.22.95.101:9300",
+}
 
-type TaskState struct {
-	ID     int
-	Stage  int
-	HydfsDest   string
-	LastStageOutputFile string
-	Cmd    *exec.Cmd
-	Stdin  io.WriteCloser
-	Stdout io.ReadCloser
-	ProcessedTuples map[string]rss.Tuple
-	AckedTuples map[string]rss.Tuple
-	mu1              sync.RWMutex
-	mu2              sync.RWMutex
-	Downstream []rss.DownstreamInfo // IP:port of next stage task
+type RainStormCommand struct {
+	Nstages         int
+	NtasksPerStage  int
+	Ops             []StageOp
+	HydfsSrc        string
+	HydfsDest       string
+	ExactlyOnce     bool
+	Autoscale       bool
+	InputRate       int
+	LW              int
+	HW              int
+}
+
+type StageOp struct {
+	Exe  string
+	Args string
 }
 
 // --------------------------
-// Global task map
+// Leader structures
 // --------------------------
 
-var tasks = map[int]*TaskState{}
-var tasksMu sync.Mutex
+type AssignTaskArgs struct {
+	TaskID int
+	Stage  int
+	Exe    string
+	Args   []string
+}
 
 // --------------------------
-// Worker RPC methods
+// Leader state
 // --------------------------
 
-type Worker struct{}
+type Leader struct {
+	mu              sync.Mutex
+	workers         []string              // set of alive workers
+	taskMapping     map[int]string        // taskID → worker addr
+	tupleBuffer     map[int][]rss.Tuple
+	ackedTuples     map[string]rss.Tuple  // Track acked tuples from stage 1
+	ackedMu         sync.RWMutex
+}
 
+// --------------------------
+// RPC Methods for Leader
+// --------------------------
 
+func (l *Leader) AckTuple(args *rss.TupleOutputArgs, reply *bool) error {
+	// Leader receives acks from first stage tasks
+	l.ackedMu.Lock()
+	l.ackedTuples[args.Tuple.Key] = args.Tuple
+	l.ackedMu.Unlock()
+
+	fmt.Printf("Leader received ack for tuple: %s\n", args.Tuple.Key)
+	*reply = true
+	return nil
+}
 
 func sendRPC(addr string, method string, args interface{}, reply interface{}) error {
-    client, err := rpc.Dial("tcp", addr)
-    if err != nil {
-        return err
-    }
-    defer client.Close()
-    return client.Call(method, args, reply)
-}
-
-
-
-func HashKey(key string) uint32 {
-    h := fnv.New32a()
-    h.Write([]byte(key))
-    return h.Sum32()
-}
-
-func parseTuple(line string) rss.Tuple {
-    parts := strings.SplitN(line, "\t", 2) // split into at most 2 parts
-    if len(parts) < 2 {
-        return rss.Tuple{
-            Key:   line,
-            Value: "",
-        }
-    }
-    return rss.Tuple{
-        Key:   parts[0],
-        Value: parts[1],
-    }
-}
-
-
-
-
-func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
-	
-	tasksMu.Lock()
-	defer tasksMu.Unlock()
-
-	argList := []string{}
-	if strings.TrimSpace(args.Args) != "" {
-		argList = strings.Fields(args.Args)
-	}
-
-	cmd := exec.Command(args.Exe, argList...)
-
-	stdin, err := cmd.StdinPipe()
+	client, err := rpc.Dial("tcp", addr)
 	if err != nil {
+		fmt.Printf("sendRPC: Failed to connect to %s: %v\n", addr, err)
 		return err
 	}
-	stdout, err := cmd.StdoutPipe()
+	defer client.Close()
+	return client.Call(method, args, reply)
+}
+
+func (l *Leader) TaskFailed(args *rss.KillTaskArgs, reply *bool) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	workerAddr, ok := l.taskMapping[args.TaskID]
+	if !ok {
+		return fmt.Errorf("task %d not found in mapping", args.TaskID)
+	}
+
+	fmt.Printf("Task %d failed on worker %s, reassigning...\n", args.TaskID, workerAddr)
+
+	// Save tuples for reassigning (in real implementation you may track in-flight tuples)
+	tuples := l.tupleBuffer[args.TaskID]
+
+	// Remove old mapping
+	delete(l.taskMapping, args.TaskID)
+	delete(l.tupleBuffer, args.TaskID)
+
+	// Reassign task to a new worker (simplest: first alive worker)
+	for _, addr := range l.workers {
+		fmt.Printf("Reassigning task %d to worker %s\n", args.TaskID, addr)
+		go l.sendTask(addr, args.TaskID, tuples)
+		break
+	}
+
+	*reply = true
+	return nil
+}
+
+// --------------------------
+// Helper methods
+// --------------------------
+
+// Assign a task to a worker
+func (l *Leader) sendTask(workerAddr string, taskID int, tuples []rss.Tuple) {
+	client, err := rpc.Dial("tcp", workerAddr)
 	if err != nil {
-		return err
+		fmt.Printf("Failed to connect to worker %s: %v\n", workerAddr, err)
+		return
+	}
+	defer client.Close()
+
+	args := AssignTaskArgs{
+		TaskID: taskID,
+		Stage:  0,       // adjust stage as needed
+		Exe:    "./op1", // example, replace with real exe
+		Args:   []string{"pattern"},
 	}
 
-	if err := cmd.Start(); err != nil {
-		return err
+	var reply bool
+	if err := client.Call("Worker.AssignTask", &args, &reply); err != nil {
+		fmt.Printf("Failed to assign task %d to worker %s: %v\n", taskID, workerAddr, err)
+		return
 	}
 
-	ts := &TaskState{
-		ID:     args.TaskID,
-		Stage:  args.Stage,
-		Cmd:    cmd,
-		HydfsDest:   args.Dest,
-		Stdin:  stdin,
-		Stdout: stdout,
-		Downstream: args.Downstream,
-		LastStageOutputFile: fmt.Sprintf("last_stage_output_%d.txt", args.TaskID),
-		ProcessedTuples:     make(map[string]rss.Tuple),
-		AckedTuples:         make(map[string]rss.Tuple),
-	}
-
-	tasks[args.TaskID] = ts
-	fmt.Printf("Assigned task: %s\n", args.Exe)
-	// Start goroutine to read task output
-	go func() {
-
-    scanner := bufio.NewScanner(ts.Stdout)
-    for scanner.Scan() {
-        line := scanner.Text()
-
-        tuple := parseTuple(line)
-
-		if len(ts.Downstream) == 0 {
-			// For now: print key/value to terminal
-			fmt.Printf("%s\t%s\n", tuple.Key, tuple.Value)
-
-			// Eventually: write to hydfs through your Node API.
-			lineOutput := fmt.Sprintf("%s\t%s\n", tuple.Key, tuple.Value)
-			os.WriteFile(ts.LastStageOutputFile, []byte(lineOutput), 0644)
-			hydfs.HandleAppend(node, ts.LastStageOutputFile, ts.HydfsDest)
-			os.WriteFile(ts.LastStageOutputFile, []byte{}, 0644)
-			continue
+	if len(tuples) > 0 {
+		addArgs := rss.AddTuplesArgs{
+			TaskID:     taskID,
+			Tuples:     tuples,
+			SourceIP:   getLocalIP() + ":9300", // Leader's IP with RPC port
+			SourceTask: -1,                      // -1 indicates leader/source
 		}
+		if err := client.Call("Worker.AddTuples", &addArgs, &reply); err != nil {
+			fmt.Printf("Failed to send tuples to task %d on worker %s: %v\n", taskID, workerAddr, err)
+		}
+	}
 
+	// Save mapping
+	l.mu.Lock()
+	l.taskMapping[taskID] = workerAddr
+	l.tupleBuffer[taskID] = tuples
+	l.mu.Unlock()
+}
 
-        idx := int(HashKey(tuple.Key)) % len(ts.Downstream)
-        target := ts.Downstream[idx]
+func discoverWorkers() []string {
+	live := []string{}
+	for _, addr := range vmMapRPC {
+		if pingWorker(addr) {
+			live = append(live, addr)
+		}
+	}
+	return live
+}
 
-        // forward
-        for {
-			
-			var dummyReply bool
-			err := sendRPC(target.IP, "Worker.AddTuples",
-				&rss.AddTuplesArgs{
-					TaskID: target.TaskID,
-					Tuples: []rss.Tuple{tuple},
-				},
-				&dummyReply,
-			)
-			if err == nil {
-				ts.mu1.Lock()
-				ts.ProcessedTuples[tuple.Key] = tuple
-				ts.mu1.Unlock()
+func pingWorker(addr string) bool {
+	client, err := rpc.Dial("tcp", addr)
+	if err != nil {
+		fmt.Printf("pingWorker: Failed to connect to %s: %v\n", addr, err)
+		return false
+	}
+	defer client.Close()
 
-				break // success, move on to next tuple
+	var ok bool
+	callErr := client.Call("Worker.Heartbeat", &struct{}{}, &ok)
+	return callErr == nil && ok
+}
+
+func parseRainStormCommand(line string) (*RainStormCommand, error) {
+	parts := strings.Fields(line)
+	if len(parts) < 7 { // minimal check
+		return nil, fmt.Errorf("not enough arguments")
+	}
+
+	if parts[0] != "RainStorm" {
+		return nil, fmt.Errorf("command must start with 'RainStorm'")
+	}
+
+	// Parse stages and tasks
+	nStages, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid Nstages: %v", err)
+	}
+
+	nTasks, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("invalid Ntasks_per_stage: %v", err)
+	}
+
+	if len(parts) < 3+2*nStages+5 { // 2 per stage + hydfs src/dest + exactly_once + autoscale + 3 optional
+		return nil, fmt.Errorf("not enough arguments for stages and parameters")
+	}
+
+	ops := make([]StageOp, nStages)
+	for i := 0; i < nStages; i++ {
+		exe := parts[3+i*2]
+		arg := parts[3+i*2+1]
+		// remove quotes if present
+		arg = strings.Trim(arg, "\"")
+		ops[i] = StageOp{
+			Exe:  exe,
+			Args: arg,
+		}
+	}
+
+	offset := 3 + 2*nStages
+	hydfsSrc := parts[offset]
+	hydfsDest := parts[offset+1]
+
+	exactlyOnce, err := strconv.ParseBool(parts[offset+2])
+	if err != nil {
+		return nil, fmt.Errorf("invalid exactly_once: %v", err)
+	}
+
+	autoscale, err := strconv.ParseBool(parts[offset+3])
+	if err != nil {
+		return nil, fmt.Errorf("invalid autoscale_enabled: %v", err)
+	}
+
+	inputRate, lw, hw := 0, 0, 0
+	if autoscale {
+		inputRate, err = strconv.Atoi(parts[offset+4])
+		if err != nil {
+			return nil, fmt.Errorf("invalid INPUT_RATE: %v", err)
+		}
+		lw, err = strconv.Atoi(parts[offset+5])
+		if err != nil {
+			return nil, fmt.Errorf("invalid LW: %v", err)
+		}
+		hw, err = strconv.Atoi(parts[offset+6])
+		if err != nil {
+			return nil, fmt.Errorf("invalid HW: %v", err)
+		}
+	}
+
+	return &RainStormCommand{
+		Nstages:        nStages,
+		NtasksPerStage: nTasks,
+		Ops:            ops,
+		HydfsSrc:       hydfsSrc,
+		HydfsDest:      hydfsDest,
+		ExactlyOnce:    exactlyOnce,
+		Autoscale:      autoscale,
+		InputRate:      inputRate,
+		LW:             lw,
+		HW:             hw,
+	}, nil
+}
+
+func taskID(stage int, index int, tasksPerStage int) int {
+	return stage*tasksPerStage + index
+}
+
+func (l *Leader) assignAllTasks(cmd *RainStormCommand) error {
+	workers := l.workers
+	if len(workers) == 0 {
+		return fmt.Errorf("no workers available")
+	}
+
+	wcount := len(workers)
+	tps := cmd.NtasksPerStage
+
+	// Precompute worker assignment for every task
+	taskToWorker := make(map[int]string)
+
+	for stage := 0; stage < cmd.Nstages; stage++ {
+		for i := 0; i < tps; i++ {
+			tid := taskID(stage, i, tps)
+			worker := workers[tid%wcount] // round-robin
+			taskToWorker[tid] = worker
+		}
+	}
+
+	// Now send AssignTask RPC for each task
+	for stage := 0; stage < cmd.Nstages; stage++ {
+		for i := 0; i < tps; i++ {
+			tid := taskID(stage, i, tps)
+			worker := taskToWorker[tid]
+
+			// Build downstream list
+			var downstream []rss.DownstreamInfo
+			if stage < cmd.Nstages-1 {
+				nextStage := stage + 1
+				for j := 0; j < tps; j++ {
+					dtid := taskID(nextStage, j, tps)
+					downstream = append(downstream, rss.DownstreamInfo{
+						IP:     taskToWorker[dtid],
+						TaskID: dtid,
+					})
+				}
 			}
-			
-			// RPC failed → notify leader
-			//notifyLeaderTaskFailed(ts.ID)
 
-			// wait for leader to push new downstream info
-			//time.Sleep(100 * time.Millisecond)
-			//idx := int(HashKey(tuple.Key)) % len(ts.Downstream) // recompute new target				//NEED TO DEAL WITH TASK FAILURE + RPC FAILURE (SCANNER FAILS)
-			//target = ts.Downstream[idx]
+			// Build RPC args
+			args := &rss.AssignTaskArgs{
+				TaskID:            tid,
+				Stage:             stage,
+				Dest:              cmd.HydfsDest,
+				Exe:               cmd.Ops[stage].Exe,
+				Args:              cmd.Ops[stage].Args,
+				Downstream:        downstream,
+				Exactly_Once:      cmd.ExactlyOnce,
+				Autoscale_Enabled: cmd.Autoscale,
+				InputRate:         cmd.InputRate,
+				LW:                cmd.LW,
+				HW:                cmd.HW,
+			}
+
+			// Perform RPC
+			var reply bool
+			if err := sendRPC(worker, "Worker.AssignTask", args, &reply); err != nil {
+				return fmt.Errorf("assigning task %d to %s failed: %v", tid, worker, err)
+			}
+
+			// Save mapping
+			l.taskMapping[tid] = worker
+		}
+	}
+
+	return nil
+}
+
+func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		return fmt.Errorf("failed to open file %s: %v", filename, err)
+	}
+	defer file.Close()
+
+	leaderIP := getLocalIP() + ":9300" // Leader's IP with RPC port
+
+	scanner := bufio.NewScanner(file)
+	lineNum := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		key := fmt.Sprintf("%s:%d", filename, lineNum)
+		tuple := rss.Tuple{
+			Key:   key,
+			Value: line,
 		}
 
-    }
-}()
+		// Hash key to pick stage 1 task
+		taskIdx := int(rss.HashKey(tuple.Key)) % nTasksStage1
+		taskID := taskID(0, taskIdx, nTasksStage1) // assuming stage 0 = first stage
+		workerAddr, ok := l.taskMapping[taskID]
+		if !ok {
+			return fmt.Errorf("no worker assigned for task %d", taskID)
+		}
 
+		// Send the tuple via RPC - Leader provides its IP for ack-back
+		args := rss.AddTuplesArgs{
+			TaskID:     taskID,
+			Tuples:     []rss.Tuple{tuple},
+			SourceIP:   leaderIP, // Leader's IP so workers can ack back
+			SourceTask: -1,       // -1 indicates this is from the leader/source
+		}
+		var reply bool
+		if err := sendRPC(workerAddr, "Worker.AddTuples", &args, &reply); err != nil {
+			fmt.Printf("failed to send tuple to worker %s task %d: %v\n", workerAddr, taskID, err)
+			// optionally buffer for retry
+		}
 
-	*reply = true
-	return nil
-}
-
-func (w *Worker) AckTuple(args *rss.TupleOutputArgs, reply *bool) error {
-	tasksMu.Lock()
-	_, ok := tasks[args.TaskID]
-	tasksMu.Unlock()
-	if !ok {
-		return fmt.Errorf("task %d not found", args.TaskID)
-	}
-	return nil
-}
-
-func (w *Worker) AddTuples(args *rss.AddTuplesArgs, reply *bool) error {
-    tasksMu.Lock()
-    ts, ok := tasks[args.TaskID]
-    tasksMu.Unlock()
-
-
-
-    if !ok {
-        return fmt.Errorf("task %d not found", args.TaskID)
-    }
-
-    // FINAL STAGE — no downstream
-    if len(ts.Downstream) == 0 {
-        // Write the tuples to the operator process
-        for _, t := range args.Tuples {
-            fmt.Fprintf(ts.Stdin, "%s\t%s\n", t.Key, t.Value)
-        }
-        *reply = true
-        return nil
-    }
-
-	ts.mu1.RLock()
-	defer ts.mu1.RUnlock()
-	if _, exists := ts.ProcessedTuples[args.Tuples[0].Key]; exists {
-		*reply = true
-        return nil
-    }
-    
-
-
-
-    // NON-FINAL STAGES
-    for _, t := range args.Tuples {
-        fmt.Fprintf(ts.Stdin, "%s\t%s\n", t.Key, t.Value)
-    }
-
-
-    *reply = true
-    return nil
-}
-
-
-
-func (w *Worker) KillTask(args *rss.KillTaskArgs, reply *bool) error {
-	tasksMu.Lock()
-	ts, ok := tasks[args.TaskID]
-	if ok {
-		delete(tasks, args.TaskID)
-	}
-	tasksMu.Unlock()
-	if !ok {
-		return fmt.Errorf("task %d not found", args.TaskID)
+		lineNum++
 	}
 
-	ts.Cmd.Process.Kill()
-	ts.Stdin.Close()
-	ts.Stdout.Close()
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading file %s: %v", filename, err)
+	}
 
-	*reply = true
 	return nil
 }
 
 func getLocalIP() string {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
+		fmt.Printf("Error getting addresses: %v\n", err)
 		log.Fatal("Error getting addresses:", err)
 	}
 
@@ -274,12 +412,8 @@ func getLocalIP() string {
 	return ""
 }
 
-func (w *Worker) Heartbeat(_ *struct{}, reply *bool) error {
-    *reply = true
-    return nil
-}
 // --------------------------
-// Main RPC listener
+// Main
 // --------------------------
 
 func main() {
@@ -318,33 +452,90 @@ func main() {
 	}
 	defer f.Close()
 
-	// Create multi-writer to log to both stdout and file
-	//mw := io.MultiWriter(os.Stdout, f)
 	log.SetOutput(f)
-
-
-
 	node = hydfs.Start()
 
-	ip := getLocalIP()
+	leader := &Leader{
+		workers:     nil,                       // start empty
+		taskMapping: make(map[int]string),      // taskID → worker
+		tupleBuffer: make(map[int][]rss.Tuple), // in-flight tuples
+		ackedTuples: make(map[string]rss.Tuple), // tuples acked by stage 1
+	}
 
+	// Register leader RPC
+	rpc.Register(leader)
 
-	port := "9300" // Or read from command-line arguments
-
-	worker := &Worker{}
-	rpc.Register(worker)
-
-	ln, err := net.Listen("tcp", ip+":"+port)
+	// Start listening for RPC connections
+	ln, err := net.Listen("tcp", ":9300") // leader port
 	if err != nil {
+		fmt.Printf("Failed to listen on :9300: %v\n", err)
 		log.Fatal(err)
 	}
-	fmt.Printf("Worker RPC listening on port %s\n", port)
+	fmt.Println("Leader RPC listening on port 9300")
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
+	// RPC listener in its own goroutine
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				continue
+			}
+			go rpc.ServeConn(conn)
+		}
+	}()
+
+	// CLI input loop
+	scanner := bufio.NewScanner(os.Stdin)
+	fmt.Println("Leader ready. Enter command:")
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
 			continue
 		}
-		go rpc.ServeConn(conn)
+
+		// Check for special CLI commands first
+		switch line {
+		case "discover":
+			leader.workers = discoverWorkers()
+			fmt.Printf("Discovered %d workers: %+v\n", len(leader.workers), leader.workers)
+			continue
+		}
+
+		// Check if it's a hydfs command
+		if hydfs.HydfsResponder(node, line) {
+			continue
+		}
+
+		// Check if it's a failure detection command
+		if node.Responder(line) {
+			continue
+		}
+
+		// Parse RainStorm commands
+		cmd, err := parseRainStormCommand(line)
+		if err != nil {
+			fmt.Println("Error parsing command:", err)
+			continue
+		}
+
+		fmt.Printf("Parsed command: %+v\n", cmd)
+
+		// Ensure workers are discovered before assigning tasks
+		if len(leader.workers) == 0 {
+			fmt.Println("No workers discovered. Please run `discover` first.")
+			continue
+		}
+
+		hydfs.HandleCreate(node, "../emptyfile.txt", cmd.HydfsDest)
+		leader.assignAllTasks(cmd)
+
+		leader.ReadFileAndSendTuples(cmd.HydfsSrc, cmd.NtasksPerStage)
+
+		fmt.Println("Command processed. Enter next command:")
+	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "Error reading input:", err)
 	}
 }
