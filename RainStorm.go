@@ -40,6 +40,8 @@ type TaskState struct {
 	InputQueue          chan TupleWithSource
 	ProcessedTuples     map[string]rss.Tuple
 	AckedTuples         map[string]rss.Tuple
+	ProcessedLogFile    string
+    AckedLogFile        string
 	mu1                 sync.RWMutex
 	mu2                 sync.RWMutex
 	Downstream          []rss.DownstreamInfo
@@ -123,7 +125,12 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 		ProcessedTuples:     make(map[string]rss.Tuple),
 		AckedTuples:         make(map[string]rss.Tuple),
 		InputQueue:          make(chan TupleWithSource, 100), // Buffered channel
+		ProcessedLogFile:    fmt.Sprintf("processed_tuples_%d.log", args.TaskID),
+    	AckedLogFile:        fmt.Sprintf("acked_tuples_%d.log", args.TaskID),
 	}
+	hydfs.HandleCreate(node, "../emptyfile.txt", ts.ProcessedLogFile)
+	hydfs.HandleCreate(node, "../emptyfile.txt", ts.AckedLogFile)
+
 
 	tasks[args.TaskID] = ts
 	fmt.Printf("Assigned task: %s\n", args.Exe)
@@ -175,6 +182,9 @@ func processTuples(ts *TaskState) {
 		ts.mu1.Lock()
 		ts.ProcessedTuples[tuple.Key] = tuple
 		ts.mu1.Unlock()
+
+		line := fmt.Sprintf("%s\t%s\n", tuple.Key, tuple.Value)
+		hydfs.HandleAppendString(node, line, ts.ProcessedLogFile)
 
 		// Handle final stage vs intermediate stage
 		if len(ts.Downstream) == 0 {
@@ -264,6 +274,9 @@ func (w *Worker) AckTuple(args *rss.TupleOutputArgs, reply *bool) error {
 	ts.mu2.Lock()
 	ts.AckedTuples[args.Tuple.Key] = args.Tuple
 	ts.mu2.Unlock()
+
+	line := fmt.Sprintf("%s\t%s\n", args.Tuple.Key, args.Tuple.Value)
+	hydfs.HandleAppendString(node, line, ts.AckedLogFile)
 
 	fmt.Printf("Task %d received ack for tuple: %s\n", args.TaskID, args.Tuple.Key)
 	*reply = true

@@ -656,6 +656,57 @@ func HandleAppend(node *fd.Node, localFile, hydfsFile string) {
 	}
 }
 
+// HandleAppendString appends a string directly to all replicas of a given HyDFS file
+// Similar to HandleAppend but takes the data as a string parameter instead of reading from a file
+func HandleAppendString(node *fd.Node, data string, hydfsFile string) {
+	// Convert string to byte slice
+	dataBytes := []byte(data)
+
+	// Find the same replicas responsible for this HyDFS file
+	replicas := getReplicas(node, hydfsFile, 3)
+	if len(replicas) == 0 {
+		log.Println("Error: no replicas available")
+		return
+	}
+
+	primary := replicas[0]
+	backups := make([]string, 0, len(replicas)-1)
+	for _, nodeID := range replicas[1:] {
+		backups = append(backups, getRPCAddrFromNodeID(nodeID))
+	}
+
+	log.Printf("Appending string data to %s on primary %s (backups: %v)\n", hydfsFile, primary, backups)
+
+	args := AppendFileArgs{
+		Filename:      hydfsFile,
+		Data:          dataBytes,
+		IsPrimary:     true,
+		OtherReplicas: backups,
+	}
+
+	var reply AppendFileReply
+
+	rpcAddr := getRPCAddrFromNodeID(primary)
+	client, err := rpc.Dial("tcp", rpcAddr)
+	if err != nil {
+		log.Printf("RPC dial error to %s: %v\n", rpcAddr, err)
+		return
+	}
+	defer client.Close()
+
+	err = client.Call("NodeRPC.AppendFile", args, &reply)
+	if err != nil {
+		log.Printf("RPC error: %v\n", err)
+		return
+	}
+
+	if reply.Success {
+		log.Printf("Append to '%s' succeeded.\n", hydfsFile)
+	} else {
+		log.Printf("Append to '%s' failed: %s\n", hydfsFile, reply.Message)
+	}
+}
+
 // handleGet fetches a file from the primary replica and saves it to a local file
 func handleGet(node *fd.Node, hydfsFile, localFile string) {
 	// Determine the primary replica for this file
@@ -1177,6 +1228,7 @@ func StdinListener(node *fd.Node) {
 	}
 
 }
+
 // HydfsResponder handles hydfs commands similar to the Responder function in failure_detection
 // Takes a command line (with arguments) and returns true if the command was handled
 func HydfsResponder(node *fd.Node, line string) bool {
