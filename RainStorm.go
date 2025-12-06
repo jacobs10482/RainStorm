@@ -265,6 +265,7 @@ func (w *Worker) AckTuple(args *rss.TupleOutputArgs, reply *bool) error {
 	ts.AckedTuples[args.Tuple.Key] = args.Tuple
 	ts.mu2.Unlock()
 
+	fmt.Printf("Task %d received ack for tuple: %s\n", args.TaskID, args.Tuple.Key)
 	*reply = true
 	return nil
 }
