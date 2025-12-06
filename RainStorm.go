@@ -31,6 +31,10 @@ type TaskState struct {
 	Cmd    *exec.Cmd
 	Stdin  io.WriteCloser
 	Stdout io.ReadCloser
+	ProcessedTuples map[string]rss.Tuple
+	AckedTuples map[string]rss.Tuple
+	mu1              sync.RWMutex
+	mu2              sync.RWMutex
 	Downstream []rss.DownstreamInfo // IP:port of next stage task
 }
 
@@ -117,12 +121,15 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 		Stdout: stdout,
 		Downstream: args.Downstream,
 		LastStageOutputFile: fmt.Sprintf("last_stage_output_%d.txt", args.TaskID),
+		ProcessedTuples:     make(map[string]rss.Tuple),
+		AckedTuples:         make(map[string]rss.Tuple),
 	}
 
 	tasks[args.TaskID] = ts
 	fmt.Printf("Assigned task: %s\n", args.Exe)
 	// Start goroutine to read task output
 	go func() {
+
     scanner := bufio.NewScanner(ts.Stdout)
     for scanner.Scan() {
         line := scanner.Text()
@@ -157,6 +164,10 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 				&dummyReply,
 			)
 			if err == nil {
+				ts.mu1.Lock()
+				ts.ProcessedTuples[tuple.Key] = tuple
+				ts.mu1.Unlock()
+
 				break // success, move on to next tuple
 			}
 			
@@ -177,10 +188,22 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 	return nil
 }
 
+func (w *Worker) AckTuple(args *rss.TupleOutputArgs, reply *bool) error {
+	tasksMu.Lock()
+	_, ok := tasks[args.TaskID]
+	tasksMu.Unlock()
+	if !ok {
+		return fmt.Errorf("task %d not found", args.TaskID)
+	}
+	return nil
+}
+
 func (w *Worker) AddTuples(args *rss.AddTuplesArgs, reply *bool) error {
     tasksMu.Lock()
     ts, ok := tasks[args.TaskID]
     tasksMu.Unlock()
+
+
 
     if !ok {
         return fmt.Errorf("task %d not found", args.TaskID)
@@ -196,10 +219,21 @@ func (w *Worker) AddTuples(args *rss.AddTuplesArgs, reply *bool) error {
         return nil
     }
 
+	ts.mu1.RLock()
+	defer ts.mu1.RUnlock()
+	if _, exists := ts.ProcessedTuples[args.Tuples[0].Key]; exists {
+		*reply = true
+        return nil
+    }
+    
+
+
+
     // NON-FINAL STAGES
     for _, t := range args.Tuples {
         fmt.Fprintf(ts.Stdin, "%s\t%s\n", t.Key, t.Value)
     }
+
 
     *reply = true
     return nil

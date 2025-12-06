@@ -323,6 +323,11 @@ func (l *Leader) assignAllTasks(cmd *RainStormCommand) error {
                 Exe:       cmd.Ops[stage].Exe,
                 Args:      cmd.Ops[stage].Args,
                 Downstream: downstream,
+				Exactly_Once:   cmd.ExactlyOnce,
+				Autoscale_Enabled: cmd.Autoscale,
+				InputRate:   cmd.InputRate,
+				LW:          cmd.LW,
+				HW:          cmd.HW,
             }
 
             // Perform RPC

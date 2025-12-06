@@ -13,6 +13,7 @@ func HashKey(key string) uint32 {
 type Tuple struct {
     Key   string
     Value string
+    //TupleID int64
 }
 
 type AssignTaskArgs struct {
@@ -22,6 +23,11 @@ type AssignTaskArgs struct {
     Args          string
     Dest          string
     Downstream []DownstreamInfo
+    Exactly_Once   bool
+    Autoscale_Enabled bool
+    InputRate   int
+    LW          int
+    HW          int
 }
 
 type DownstreamInfo struct {
