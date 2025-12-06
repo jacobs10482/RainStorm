@@ -309,7 +309,7 @@ func (r *NodeRPC) AppendFile(args AppendFileArgs, reply *AppendFileReply) error 
 		reply.Message = fmt.Sprintf("Appended to %s on replica %s", args.Filename, r.node.Addr)
 	}
 
-	fmt.Printf("[Replica %s] END append for %s successfully completed\n\n",
+	log.Printf("[Replica %s] END append for %s successfully completed\n\n",
 		r.node.Addr, args.Filename)
 
 	return nil
