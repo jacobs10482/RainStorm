@@ -391,15 +391,12 @@ func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int) error 
 // --------------------------
 
 func main() {
+	node := hydfs.Start()
 
-	node = hydfs.Start()
-
-
-	
 	leader := &Leader{
-		workers:     discoverWorkers(),         // list of available VMs
-		taskMapping: make(map[int]string),      // taskID → worker
-		tupleBuffer: make(map[int][]rss.Tuple), // in-flight tuples
+		workers:     nil,                        // start empty
+		taskMapping: make(map[int]string),       // taskID → worker
+		tupleBuffer: make(map[int][]rss.Tuple),  // in-flight tuples
 	}
 
 	// Register leader RPC
@@ -423,9 +420,9 @@ func main() {
 		}
 	}()
 
-	// CLI input loop in main goroutine
+	// CLI input loop
 	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Println("Leader ready. Enter RainStorm command:")
+	fmt.Println("Leader ready. Enter command:")
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -433,6 +430,15 @@ func main() {
 			continue
 		}
 
+		// Check for special CLI commands first
+		switch line {
+		case "discover":
+			leader.workers = discoverWorkers()
+			fmt.Printf("Discovered %d workers: %+v\n", len(leader.workers), leader.workers)
+			continue
+		}
+
+		// Parse RainStorm commands
 		cmd, err := parseRainStormCommand(line)
 		if err != nil {
 			fmt.Println("Error parsing command:", err)
@@ -441,17 +447,19 @@ func main() {
 
 		fmt.Printf("Parsed command: %+v\n", cmd)
 
+		// Ensure workers are discovered before assigning tasks
+		if len(leader.workers) == 0 {
+			fmt.Println("No workers discovered. Please run `discover` first.")
+			continue
+		}
+
 		hydfs.HandleCreate(node, "emptyfile.txt", cmd.HydfsDest)
 		leader.assignAllTasks(cmd)
 
-
-
-		// TODO: pass cmd to RainStorm start logic
 		fmt.Println("Command processed. Enter next command:")
 	}
 
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintln(os.Stderr, "Error reading input:", err)
 	}
-
 }
