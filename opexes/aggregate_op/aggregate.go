@@ -50,15 +50,11 @@ func main() {
 
 		// Count occurrences
 		counts[key]++
+		fmt.Printf("%s\t%d\n", key, counts[key])
 	}
 
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintln(os.Stderr, "Error reading stdin:", err)
 	}
 
-	// Output final counts as tuples:
-	// key<TAB>count
-	for key, ct := range counts {
-		fmt.Printf("%s\t%d\n", key, ct)
-	}
 }
