@@ -441,6 +441,16 @@ func main() {
 			continue
 		}
 
+		// Check if it's a hydfs command
+		if hydfs.HydfsResponder(node, line) {
+			continue
+		}
+
+		// Check if it's a failure detection command
+		if node.Responder(line) {
+			continue
+		}
+
 		// Parse RainStorm commands
 		cmd, err := parseRainStormCommand(line)
 		if err != nil {

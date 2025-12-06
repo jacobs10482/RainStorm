@@ -1177,6 +1177,154 @@ func StdinListener(node *fd.Node) {
 	}
 
 }
+// HydfsResponder handles hydfs commands similar to the Responder function in failure_detection
+// Takes a command line (with arguments) and returns true if the command was handled
+func HydfsResponder(node *fd.Node, line string) bool {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return false
+	}
+
+	args := strings.Fields(line)
+	if len(args) == 0 {
+		return false
+	}
+
+	cmd := args[0]
+
+	switch cmd {
+	case "list_mem_ids":
+		handleListMemIds(node)
+		return true
+
+	case "liststore":
+		listLocalStore()
+		return true
+
+	case "create":
+		if len(args) != 3 {
+			fmt.Println("Usage: create <localfilename> <HyDFSfilename>")
+			return true
+		}
+		localFile := args[1]
+		hyDFSFile := args[2]
+		fmt.Printf("[create] %s -> %s\n", localFile, hyDFSFile)
+		HandleCreate(node, localFile, hyDFSFile)
+		return true
+
+	case "get":
+		if len(args) != 3 {
+			fmt.Println("Usage: get <HyDFSfilename> <localfilename>")
+			return true
+		}
+		hydfsFile := args[1]
+		localFile := args[2]
+		fmt.Printf("[get] %s -> %s\n", hydfsFile, localFile)
+		handleGet(node, hydfsFile, localFile)
+		return true
+
+	case "append":
+		if len(args) != 3 {
+			fmt.Println("Usage: append <localfilename> <HyDFSfilename>")
+			return true
+		}
+		localFile := args[1]
+		hyDFSFile := args[2]
+		fmt.Printf("[append] %s -> %s\n", localFile, hyDFSFile)
+		HandleAppend(node, localFile, hyDFSFile)
+		return true
+
+	case "merge":
+		if len(args) != 2 {
+			fmt.Println("Usage: merge <HyDFSfilename>")
+			return true
+		}
+		hydfsFile := args[1]
+		fmt.Printf("[merge] Starting merge for %s\n", hydfsFile)
+
+		// Merge on primary
+		replicas := getReplicas(node, hydfsFile, 3)
+		if len(replicas) == 0 {
+			fmt.Println("No replicas found")
+			return true
+		}
+
+		primary := getRPCAddrFromNodeID(replicas[0])
+		client, err := rpc.Dial("tcp", primary)
+		if err != nil {
+			fmt.Printf("RPC dial error to %s: %v\n", primary, err)
+			return true
+		}
+
+		var reply MergeFileReply
+		err = client.Call("NodeRPC.MergeFile", MergeFileArgs{Filename: hydfsFile}, &reply)
+		client.Close()
+		if err != nil {
+			fmt.Printf("RPC error: %v\n", err)
+			return true
+		}
+		fmt.Println(reply.Message)
+		return true
+
+	case "ls":
+		if len(args) != 2 {
+			fmt.Println("Usage: ls <HyDFSfilename>")
+			return true
+		}
+		hyDFSFile := args[1]
+		handleLS(node, hyDFSFile)
+		return true
+
+	case "getfromreplica":
+		if len(args) != 4 {
+			fmt.Println("Usage: getfromreplica <VMaddr> <HyDFSfilename> <localfilename>")
+			return true
+		}
+		replicaIP := args[1]
+		hydfsFile := args[2]
+		localFile := args[3]
+		fmt.Printf("[getfromreplica] %s %s -> %s\n", replicaIP, hydfsFile, localFile)
+		handleGetFromReplica(replicaIP, hydfsFile, localFile)
+		return true
+
+	case "multiappend":
+		if len(args) < 4 {
+			fmt.Println("Usage: multiappend <HyDFSfilename> <vm1> <vm2> ... <localfile1> <localfile2> ...")
+			return true
+		}
+		hydfsFile := args[1]
+		half := (len(args) - 2) / 2
+		vmNames := args[2 : 2+half]
+		localFiles := args[2+half:]
+
+		if len(vmNames) != len(localFiles) {
+			fmt.Println("Error: number of VMs and local files must match")
+			return true
+		}
+
+		vmFiles := make(map[string]string)
+		for i := range vmNames {
+			addr, ok := vmMapRPC[vmNames[i]]
+			if !ok {
+				fmt.Printf("Error: unknown VM name '%s'\n", vmNames[i])
+				continue
+			}
+			vmFiles[addr] = localFiles[i]
+		}
+
+		fmt.Printf("[multiappend] %s: launching appends from %v\n", hydfsFile, vmNames)
+		handleMultiAppend(hydfsFile, vmFiles)
+		return true
+
+	case "testreplicas":
+		replicas := getReplicas(node, "helloworld", 3)
+		fmt.Println("Replicas for 'helloworld':", replicas)
+		return true
+
+	default:
+		return false
+	}
+}
 
 // initHyDFSDir initializes the HyDFS directory
 func initHyDFSDir() (string, error) {
