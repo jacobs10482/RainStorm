@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"io"
+	//"io"
 	"log"
 	"math/rand"
 	"net"
@@ -551,8 +551,8 @@ func InitializeFailureDetection() *Node {
 	defer f.Close()
 
 	// Create multi-writer to log to both stdout and file
-	mw := io.MultiWriter(os.Stdout, f)
-	log.SetOutput(mw)
+	//mw := io.MultiWriter(os.Stdout, f)
+	log.SetOutput(f)
 
 	// Create and configure the node
 	node := NewNode(string(selfIP))
