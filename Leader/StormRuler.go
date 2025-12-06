@@ -82,8 +82,9 @@ type Leader struct {
 
 
 func sendRPC(addr string, method string, args interface{}, reply interface{}) error {
-    client, err := rpc.Dial("tcp", addr+":9300")
+    client, err := rpc.Dial("tcp", addr)
     if err != nil {
+		fmt.Printf("sendRPC: Failed to connect to %s:9300: %v\n", addr, err)
         return err
     }
     defer client.Close()
@@ -177,6 +178,7 @@ func discoverWorkers() []string {
 func pingWorker(addr string) bool {
     client, err := rpc.Dial("tcp", addr)
     if err != nil {
+		fmt.Printf("pingWorker: Failed to connect to %s: %v\n", addr, err)
         return false
     }
     defer client.Close()
@@ -405,6 +407,7 @@ func main() {
 	// Start listening for RPC connections
 	ln, err := net.Listen("tcp", ":9300") // leader port
 	if err != nil {
+		fmt.Printf("Failed to listen on :9300: %v\n", err)
 		log.Fatal(err)
 	}
 	log.Println("Leader RPC listening on port 9300")

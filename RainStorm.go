@@ -178,30 +178,33 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 }
 
 func (w *Worker) AddTuples(args *rss.AddTuplesArgs, reply *bool) error {
-	tasksMu.Lock()
-	ts, ok := tasks[args.TaskID]
-	tasksMu.Unlock()
-	if !ok {
-		return fmt.Errorf("task %d not found", args.TaskID)
-	}
+    tasksMu.Lock()
+    ts, ok := tasks[args.TaskID]
+    tasksMu.Unlock()
 
-	for _, t := range args.Tuples {
-		// compute which downstream index this tuple would go to
-		idx := int(HashKey(t.Key)) % len(ts.Downstream)
-		if ts.Downstream[idx].TaskID != args.TaskID {
-			// tuple does not belong to this task
-			// placeholder: log error or return error
-			log.Printf("Tuple with key %s does not belong to task %d", t.Key, args.TaskID)
-			continue // skip or return error
-		}
+    if !ok {
+        return fmt.Errorf("task %d not found", args.TaskID)
+    }
 
-		// tuple is correct, write to stdin
-		fmt.Fprintf(ts.Stdin, "%s\t%s\n", t.Key, t.Value)
-	}
+    // FINAL STAGE — no downstream
+    if len(ts.Downstream) == 0 {
+        // Write the tuples to the operator process
+        for _, t := range args.Tuples {
+            fmt.Fprintf(ts.Stdin, "%s\t%s\n", t.Key, t.Value)
+        }
+        *reply = true
+        return nil
+    }
 
-	*reply = true
-	return nil
+    // NON-FINAL STAGES
+    for _, t := range args.Tuples {
+        fmt.Fprintf(ts.Stdin, "%s\t%s\n", t.Key, t.Value)
+    }
+
+    *reply = true
+    return nil
 }
+
 
 
 func (w *Worker) KillTask(args *rss.KillTaskArgs, reply *bool) error {
