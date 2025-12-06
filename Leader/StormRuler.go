@@ -101,7 +101,7 @@ func (l *Leader) TaskFailed(args *rss.KillTaskArgs, reply *bool) error {
 		return fmt.Errorf("task %d not found in mapping", args.TaskID)
 	}
 
-	log.Printf("Task %d failed on worker %s, reassigning...\n", args.TaskID, workerAddr)
+	fmt.Printf("Task %d failed on worker %s, reassigning...\n", args.TaskID, workerAddr)
 
 	// Save tuples for reassigning (in real implementation you may track in-flight tuples)
 	tuples := l.tupleBuffer[args.TaskID]
@@ -112,7 +112,7 @@ func (l *Leader) TaskFailed(args *rss.KillTaskArgs, reply *bool) error {
 
 	// Reassign task to a new worker (simplest: first alive worker)
 	for _, addr := range l.workers {
-		log.Printf("Reassigning task %d to worker %s\n", args.TaskID, addr)
+		fmt.Printf("Reassigning task %d to worker %s\n", args.TaskID, addr)
 		go l.sendTask(addr, args.TaskID, tuples)
 		break
 	}
@@ -130,7 +130,7 @@ func (l *Leader) TaskFailed(args *rss.KillTaskArgs, reply *bool) error {
 func (l *Leader) sendTask(workerAddr string, taskID int, tuples []rss.Tuple) {
 	client, err := rpc.Dial("tcp", workerAddr)
 	if err != nil {
-		log.Printf("Failed to connect to worker %s: %v\n", workerAddr, err)
+		fmt.Printf("Failed to connect to worker %s: %v\n", workerAddr, err)
 		return
 	}
 	defer client.Close()
@@ -144,7 +144,7 @@ func (l *Leader) sendTask(workerAddr string, taskID int, tuples []rss.Tuple) {
 
 	var reply bool
 	if err := client.Call("Worker.AssignTask", &args, &reply); err != nil {
-		log.Printf("Failed to assign task %d to worker %s: %v\n", taskID, workerAddr, err)
+		fmt.Printf("Failed to assign task %d to worker %s: %v\n", taskID, workerAddr, err)
 		return
 	}
 
@@ -154,7 +154,7 @@ func (l *Leader) sendTask(workerAddr string, taskID int, tuples []rss.Tuple) {
 			Tuples: tuples,
 		}
 		if err := client.Call("Worker.AddTuples", &addArgs, &reply); err != nil {
-			log.Printf("Failed to send tuples to task %d on worker %s: %v\n", taskID, workerAddr, err)
+			fmt.Printf("Failed to send tuples to task %d on worker %s: %v\n", taskID, workerAddr, err)
 		}
 	}
 
@@ -371,7 +371,7 @@ func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int) error 
         }
         var reply bool
         if err := sendRPC(workerAddr, "Worker.AddTuples", &args, &reply); err != nil {
-            log.Printf("failed to send tuple to worker %s task %d: %v", workerAddr, taskID, err)
+            fmt.Printf("failed to send tuple to worker %s task %d: %v", workerAddr, taskID, err)
             // optionally buffer for retry
         }
 
@@ -388,6 +388,7 @@ func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int) error 
 func getLocalIP() string {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
+		fmt.Printf("Error getting addresses: %v\n", err)
 		log.Fatal("Error getting addresses:", err)
 	}
 
@@ -460,7 +461,7 @@ func main() {
 		fmt.Printf("Failed to listen on :9300: %v\n", err)
 		log.Fatal(err)
 	}
-	log.Println("Leader RPC listening on port 9300")
+	fmt.Println("Leader RPC listening on port 9300")
 
 	// RPC listener in its own goroutine
 	go func() {
