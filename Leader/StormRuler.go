@@ -516,12 +516,45 @@ func main() {
 		}
 
 		// Check for special CLI commands first
-		switch line {
+		args := strings.Fields(line)
+		if len(args) == 0 {
+			continue
+		}
+		cmd_type := args[0]
+		switch cmd_type {
 		case "discover":
 			leader.workers = discoverWorkers()
 			fmt.Printf("Discovered %d workers: %+v\n", len(leader.workers), leader.workers)
 			continue
+		case "kill_task":
+			parts := strings.Fields(line)
+			if len(parts) < 2 {
+				fmt.Println("Usage: kill_task <task_id>")
+				continue
+			}
+			taskID, err := strconv.Atoi(parts[1])
+			if err != nil {
+				fmt.Println("Error parsing task ID:", err)
+				continue
+			}
+			var reply bool
+			worker, ok := leader.taskMapping[taskID]
+			if !ok {
+				fmt.Println("Task not found")
+				continue
+			}
+			if err := sendRPC(worker.IP, "Worker.KillTask", &rss.KillTaskArgs{TaskID: taskID}, &reply); err != nil {
+				fmt.Println("Error killing task:", err)
+				continue
+			}
+			if !reply {
+				fmt.Println("Failed to kill task")
+				continue
+			}
+			fmt.Printf("Task %d killed successfully\n", taskID)
+			continue
 		}
+
 
 		// Check if it's a hydfs command
 		if hydfs.HydfsResponder(node, line) {
