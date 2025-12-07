@@ -90,6 +90,42 @@ func parseTuple(line string) rss.Tuple {
 		Value: parts[1],
 	}
 }
+ // Add this helper function to rainstorm.go
+
+func loadStateFromHyDFS(logFilename string) (map[string]rss.Tuple, error) {
+    stateMap := make(map[string]rss.Tuple)
+    
+    // 1. Try to get the file from HyDFS to a local temp file
+    // We append .tmp to avoid conflict with the actual append-only log we will write to later
+    localTempFile := "temp_recovery_" + logFilename
+    
+    // Assuming hydfs.HandleGet(node, remote, local) exists based on MP3 context
+    // If the file doesn't exist in HyDFS (first time run), this might return an error.
+    // We treat that as an empty state.
+    hydfs.HandleGet(node, logFilename, localTempFile)
+    defer os.Remove(localTempFile) // Clean up temp file
+
+    // 2. Read the local file
+    file, err := os.Open(localTempFile)
+    if err != nil {
+        return stateMap, nil
+    }
+    defer file.Close()
+
+    scanner := bufio.NewScanner(file)
+    for scanner.Scan() {
+        line := scanner.Text()
+        if strings.TrimSpace(line) == "" {
+            continue
+        }
+        // Parse the tuple using your existing helper
+        tuple := parseTuple(line)
+        stateMap[tuple.Key] = tuple
+    }
+
+    fmt.Printf("Recovered %d items from %s\n", len(stateMap), logFilename)
+    return stateMap, nil
+}
 
 func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 	tasksMu.Lock()
@@ -115,6 +151,15 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 		return err
 	}
 
+	// Define log filenames based on TaskID
+    processedLog := fmt.Sprintf("processed_tuples_%d.log", args.TaskID)
+    ackedLog := fmt.Sprintf("acked_tuples_%d.log", args.TaskID)
+
+    // Attempt to recover state from HyDFS
+    // Note: If files don't exist, these functions return empty maps (fresh start)
+    recoveredProcessed, _ := loadStateFromHyDFS(processedLog)
+    recoveredAcked, _ := loadStateFromHyDFS(ackedLog)
+
 	ts := &TaskState{
 		ID:                  args.TaskID,
 		Stage:               args.Stage,
@@ -124,15 +169,17 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 		Stdout:              stdout,
 		Downstream:          args.Downstream,
 		LastStageOutputFile: fmt.Sprintf("last_stage_output_%d.txt", args.TaskID),
-		ProcessedTuples:     make(map[string]rss.Tuple),
-		AckedTuples:         make(map[string]rss.Tuple),
+		ProcessedTuples:     recoveredProcessed,
+		AckedTuples:         recoveredAcked,
 		InputQueue:          make(chan TupleWithSource, 100), // Buffered channel
-		ProcessedLogFile:    fmt.Sprintf("processed_tuples_%d.log", args.TaskID),
-    	AckedLogFile:        fmt.Sprintf("acked_tuples_%d.log", args.TaskID),
+		ProcessedLogFile:    processedLog,
+    	AckedLogFile:        ackedLog,
 		FailureChan:         make(chan error, 1),
 	}
-	hydfs.HandleCreate(node, "../emptyfile.txt", ts.ProcessedLogFile)
-	hydfs.HandleCreate(node, "../emptyfile.txt", ts.AckedLogFile)
+	if len(recoveredProcessed) == 0 {
+        hydfs.HandleCreate(node, "../emptyfile.txt", ts.ProcessedLogFile)
+        hydfs.HandleCreate(node, "../emptyfile.txt", ts.AckedLogFile)
+    }
 
 
 	tasks[args.TaskID] = ts
