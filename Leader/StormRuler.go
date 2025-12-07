@@ -582,50 +582,48 @@ func (l *Leader) handleListTasks() {
 }
 
 func splitArgs(input string) ([]string, error) {
-    var args []string
-    var current strings.Builder
-    inQuote := false
-    var quoteChar rune
+	var args []string
+	var current strings.Builder
+	inQuote := false
 
-    for i, r := range input {
-        switch r {
-        case ' ', '\t':
-            if inQuote {
-                current.WriteRune(r) // keep spaces inside quotes
-            } else if current.Len() > 0 {
-                args = append(args, current.String())
-                current.Reset()
-            }
-        case '"', '\u201c', '\u201d':
-            if inQuote {
-                if r == quoteChar || (quoteChar != '"' && r == '"') { 
-                    // closing quote
-                    args = append(args, current.String())
-                    current.Reset()
-                    inQuote = false
-                } else {
-                    current.WriteRune(r) // treat as literal inside other quotes
-                }
-            } else {
-                inQuote = true
-                quoteChar = r
-            }
-        default:
-            current.WriteRune(r)
-        }
+	for _, r := range input {
+		switch r {
+		case '"', '“', '”':
+			if inQuote {
+				// Closing quote, finish current arg
+				args = append(args, current.String())
+				current.Reset()
+				inQuote = false
+			} else {
+				// Opening quote
+				inQuote = true
+			}
+		case ' ', '\t':
+			if inQuote {
+				current.WriteRune(r) // inside quotes, keep spaces
+			} else {
+				if current.Len() > 0 {
+					args = append(args, current.String())
+					current.Reset()
+				}
+			}
+		default:
+			current.WriteRune(r)
+		}
+	}
 
-        // handle end of string
-        if i == len(input)-1 && current.Len() > 0 {
-            args = append(args, current.String())
-        }
-    }
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
 
-    if inQuote {
-        return nil, fmt.Errorf("unterminated quote in input")
-    }
+	// If still inQuote at the end, just close it (for mismatched quotes)
+	if inQuote {
+		// optionally, you could log a warning
+	}
 
-    return args, nil
+	return args, nil
 }
+
 
 
 
