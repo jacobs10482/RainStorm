@@ -381,7 +381,7 @@ func processTuples(ts *TaskState) {
 		}
 		ts.mu1.RUnlock()
 
-		fmt.Printf("Input Tuple: %s, Value: %s\n", tuple.Key, tuple.Value)
+		//fmt.Printf("Input Tuple: %s, Value: %s\n", tuple.Key, tuple.Value)
 		// Write tuple to operator's stdin
 		_, err := fmt.Fprintf(ts.Stdin, "%s\t%s\n", tuple.Key, tuple.Value)
 		if err != nil {
@@ -408,15 +408,16 @@ func processTuples(ts *TaskState) {
 		line := fmt.Sprintf("%s\t%s\n", tuple.Key, tuple.Value)
 		hydfs.HandleAppendString(node, line, ts.ProcessedLogFile)
 
+		if outputTuple.Value == "__DROP__" {
+				// Just ack back to the source (filtered out)
+				sendAck(tupleWithSource.SourceIP, tupleWithSource.SourceTask, tuple)
+				continue
+		}
+
 		// Handle final stage vs intermediate stage
 		if len(ts.Downstream) == 0 {
 			// Final stage - write to HyDFS
 			// If operator signalled a filtered/dropped tuple, don't write to HyDFS
-			if outputTuple.Value == "__DROP__" {
-				// Just ack back to the source (filtered out)
-				sendAck(tupleWithSource.SourceIP, tupleWithSource.SourceTask, tuple)
-				continue
-			}
 
 			fmt.Printf("%s\t%s\n", outputTuple.Key, outputTuple.Value)
 
