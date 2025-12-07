@@ -191,7 +191,7 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *int) error {
 	}
 
 	tasks[args.TaskID] = ts
-	fmt.Printf("Assigned task: %s\n", args.Exe)
+	fmt.Printf("Assigned task: %s\n, Args: %s", args.Exe, args.Args)
 
 	// Start goroutine to process tuples
 	go processTuples(ts)

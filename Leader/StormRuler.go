@@ -575,6 +575,8 @@ func parseRainStormCommand(line string) (*RainStormCommand, error) {
 		return nil, fmt.Errorf("not enough arguments for stages and parameters")
 	}
 
+
+	fmt.Printf("Stages: %d\n", nStages)
 	ops := make([]StageOp, nStages)
 	for i := 0; i < nStages; i++ {
 		exe := parts[3+i*2]
