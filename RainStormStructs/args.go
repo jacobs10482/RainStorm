@@ -9,9 +9,9 @@ func HashKey(key string) uint32 {
 }
 
 type Tuple struct {
-	Key   string
-	Value string
-	//TupleID int64
+	TupleID string // Unique ID: "taskID:seqNum" or "leader:lineNum"
+	Key     string
+	Value   string
 }
 
 type AssignTaskArgs struct {

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -72,10 +73,10 @@ type Leader struct {
 	workers         []string                 // set of alive workers
 	taskMapping     map[int]rss.TaskIPAndPID // taskID → worker addr
 	tupleBuffer     map[int][]rss.Tuple
-	ackedTuples     map[string]rss.Tuple // Track acked tuples from stage 1
+	ackedTuples     map[string]rss.Tuple // Track acked tuples from stage 1, keyed by TupleID
 	ackedMu         sync.RWMutex
-	sentTuples      map[string]rss.Tuple // Track tuples sent by leader (for resends)
-	sentTask        map[string]int       // mapping tuple key -> taskID it was sent to
+	sentTuples      map[string]rss.Tuple // Track tuples sent by leader, keyed by TupleID
+	sentTask        map[string]int       // mapping TupleID -> taskID it was sent to
 	sentMu          sync.RWMutex
 	ExactlyOnce     bool
 	Autoscale       bool
@@ -87,7 +88,8 @@ type Leader struct {
 	metricsPerTask  map[int]float64 // taskID -> last reported rate
 	metricsMu       sync.Mutex
 	RoundRobinIndex int
-	nextTaskID      int // counter for generating unique task IDs
+	nextTaskID      int   // counter for generating unique task IDs
+	leaderSeqNum    int64 // atomic counter for generating leader TupleIDs
 }
 
 // --------------------------
@@ -95,12 +97,12 @@ type Leader struct {
 // --------------------------
 
 func (l *Leader) AckTuple(args *rss.TupleOutputArgs, reply *bool) error {
-	// Leader receives acks from first stage tasks
+	// Leader receives acks from first stage tasks, keyed by TupleID
 	l.ackedMu.Lock()
-	l.ackedTuples[args.Tuple.Key] = args.Tuple
+	l.ackedTuples[args.Tuple.TupleID] = args.Tuple
 	l.ackedMu.Unlock()
 
-	fmt.Printf("Leader received ack for tuple: %s\n", args.Tuple.Key)
+	fmt.Printf("Leader received ack for tuple: %s (TupleID: %s)\n", args.Tuple.Key, args.Tuple.TupleID)
 	*reply = true
 	return nil
 }
@@ -503,7 +505,7 @@ func (l *Leader) monitorSent() {
 				continue
 			}
 
-			log.Printf("Leader: Tuple %s not acked, resending to task %d at %s", key, tid, wp.IP)
+			log.Printf("Leader: TupleID %s not acked, resending to task %d at %s", tuple.TupleID, tid, wp.IP)
 			var dummy bool
 			args := &rss.AddTuplesArgs{
 				TaskID:     tid,
@@ -623,10 +625,6 @@ func splitArgs(input string) ([]string, error) {
 
 	return args, nil
 }
-
-
-
-
 
 func parseRainStormCommand(line string) (*RainStormCommand, error) {
 	parts, err := splitArgs(line)
@@ -824,9 +822,15 @@ func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int, inputR
 		}
 		line := scanner.Text()
 		key := fmt.Sprintf("%s:%d", filename, lineNum)
+
+		// Generate unique TupleID for leader-generated tuples
+		seqNum := atomic.AddInt64(&l.leaderSeqNum, 1)
+		tupleID := fmt.Sprintf("leader:%d", seqNum)
+
 		tuple := rss.Tuple{
-			Key:   key,
-			Value: line,
+			TupleID: tupleID,
+			Key:     key,
+			Value:   line,
 		}
 
 		// Choose stage-1 task from the current live list instead of relying
@@ -864,10 +868,10 @@ func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int, inputR
 			// optionally buffer for retry
 		}
 
-		// Record that leader sent this tuple so we can resend until acked
+		// Record that leader sent this tuple so we can resend until acked (keyed by TupleID)
 		l.sentMu.Lock()
-		l.sentTuples[key] = tuple
-		l.sentTask[key] = taskID
+		l.sentTuples[tupleID] = tuple
+		l.sentTask[tupleID] = taskID
 		l.sentMu.Unlock()
 
 		lineNum++

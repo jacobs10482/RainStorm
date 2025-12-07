@@ -43,14 +43,15 @@ type TaskState struct {
 	Stdout              io.ReadCloser
 	InputQueue          chan TupleWithSource
 	FailureChan         chan error
-	ProcessedTuples     map[string]rss.Tuple
-	AckedTuples         map[string]rss.Tuple
+	ProcessedTuples     map[string]rss.Tuple // keyed by TupleID
+	AckedTuples         map[string]rss.Tuple // keyed by TupleID
 	ProcessedLogFile    string
 	AckedLogFile        string
 	mu1                 sync.RWMutex
 	mu2                 sync.RWMutex
 	Downstream          []rss.DownstreamInfo
 	InputCount          int64
+	SeqNum              int64 // atomic counter for generating output TupleIDs
 }
 
 // --------------------------
@@ -81,17 +82,28 @@ func HashKey(key string) uint32 {
 	return h.Sum32()
 }
 
+// parseTuple parses a log line in format "TupleID\tKey\tValue" or legacy "Key\tValue"
 func parseTuple(line string) rss.Tuple {
-	parts := strings.SplitN(line, "\t", 2)
-	if len(parts) < 2 {
+	parts := strings.SplitN(line, "\t", 3)
+	if len(parts) == 3 {
+		// New format: TupleID\tKey\tValue
 		return rss.Tuple{
-			Key:   line,
-			Value: "",
+			TupleID: parts[0],
+			Key:     parts[1],
+			Value:   parts[2],
+		}
+	} else if len(parts) == 2 {
+		// Legacy format: Key\tValue (no TupleID)
+		return rss.Tuple{
+			TupleID: "",
+			Key:     parts[0],
+			Value:   parts[1],
 		}
 	}
 	return rss.Tuple{
-		Key:   parts[0],
-		Value: parts[1],
+		TupleID: "",
+		Key:     line,
+		Value:   "",
 	}
 }
 
@@ -123,9 +135,11 @@ func loadStateFromHyDFS(logFilename string) (map[string]rss.Tuple, error) {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		// Parse the tuple using your existing helper
+		// Parse the tuple using helper - now uses TupleID as key
 		tuple := parseTuple(line)
-		stateMap[tuple.Key] = tuple
+		if tuple.TupleID != "" {
+			stateMap[tuple.TupleID] = tuple
+		}
 	}
 
 	fmt.Printf("Recovered %d items from %s\n", len(stateMap), logFilename)
@@ -287,8 +301,8 @@ func monitorAcks(ts *TaskState) {
 
 		ts.mu1.RLock()
 		ts.mu2.RLock()
-		for key, tuple := range ts.ProcessedTuples {
-			if _, acked := ts.AckedTuples[key]; !acked {
+		for tupleID, tuple := range ts.ProcessedTuples {
+			if _, acked := ts.AckedTuples[tupleID]; !acked {
 				unackedTuples = append(unackedTuples, tuple)
 			}
 		}
@@ -299,14 +313,14 @@ func monitorAcks(ts *TaskState) {
 		for _, tuple := range unackedTuples {
 			// Double-check it's still unacked (might have been acked during copy)
 			ts.mu2.RLock()
-			_, acked := ts.AckedTuples[tuple.Key]
+			_, acked := ts.AckedTuples[tuple.TupleID]
 			ts.mu2.RUnlock()
 
 			if acked {
 				continue // Got acked while we were copying, skip it
 			}
 
-			log.Printf("Task %d: Tuple %s not acked, resending", ts.ID, tuple.Key)
+			log.Printf("Task %d: Tuple %s (TupleID: %s) not acked, resending", ts.ID, tuple.Key, tuple.TupleID)
 
 			if len(ts.Downstream) == 0 {
 				continue // Final stage, nothing to resend to
@@ -327,7 +341,7 @@ func monitorAcks(ts *TaskState) {
 			)
 
 			if err != nil {
-				log.Printf("Task %d: Failed to resend tuple %s: %v", ts.ID, tuple.Key, err)
+				log.Printf("Task %d: Failed to resend tuple %s: %v", ts.ID, tuple.TupleID, err)
 				// Could notify leader of downstream failure here
 			}
 		}
@@ -359,7 +373,7 @@ func processTuples(ts *TaskState) {
 	scanner := bufio.NewScanner(ts.Stdout)
 
 	for tupleWithSource := range ts.InputQueue {
-		fmt.Printf("Task %d processing tuple: %s\n", ts.ID, tupleWithSource.Tuple.Key)
+		fmt.Printf("Task %d processing tuple: %s (TupleID: %s)\n", ts.ID, tupleWithSource.Tuple.Key, tupleWithSource.Tuple.TupleID)
 		select {
 		case err := <-ts.FailureChan:
 			// Something was sent: exit the goroutine
@@ -371,9 +385,9 @@ func processTuples(ts *TaskState) {
 
 		tuple := tupleWithSource.Tuple
 
-		// Check for duplicates (idempotency)
+		// Check for duplicates using TupleID (idempotency)
 		ts.mu1.RLock()
-		if _, exists := ts.ProcessedTuples[tuple.Key]; exists {
+		if _, exists := ts.ProcessedTuples[tuple.TupleID]; exists {
 			ts.mu1.RUnlock()
 			// Already processed, send ack anyway
 			sendAck(tupleWithSource.SourceIP, tupleWithSource.SourceTask, tuple)
@@ -389,7 +403,7 @@ func processTuples(ts *TaskState) {
 			continue
 		}
 
-		// Read output from operator's stdout
+		// Read output from operator's stdout (format: Key\tValue)
 		if !scanner.Scan() {
 			if err := scanner.Err(); err != nil {
 				log.Printf("Error reading from stdout for task %d: %v", ts.ID, err)
@@ -398,14 +412,33 @@ func processTuples(ts *TaskState) {
 		}
 
 		outputLine := scanner.Text()
-		outputTuple := parseTuple(outputLine)
+		// Operator outputs Key\tValue, we need to parse and generate TupleID
+		parts := strings.SplitN(outputLine, "\t", 2)
+		var outputKey, outputValue string
+		if len(parts) == 2 {
+			outputKey = parts[0]
+			outputValue = parts[1]
+		} else {
+			outputKey = outputLine
+			outputValue = ""
+		}
 
-		// Mark as processed
+		// Generate unique TupleID for the output tuple
+		seqNum := atomic.AddInt64(&ts.SeqNum, 1)
+		outputTupleID := fmt.Sprintf("%d:%d", ts.ID, seqNum)
+		outputTuple := rss.Tuple{
+			TupleID: outputTupleID,
+			Key:     outputKey,
+			Value:   outputValue,
+		}
+
+		// Mark input as processed using TupleID
 		ts.mu1.Lock()
-		ts.ProcessedTuples[tuple.Key] = tuple
+		ts.ProcessedTuples[tuple.TupleID] = tuple
 		ts.mu1.Unlock()
 
-		line := fmt.Sprintf("%s\t%s\n", tuple.Key, tuple.Value)
+		// Write to log with TupleID format: TupleID\tKey\tValue
+		line := fmt.Sprintf("%s\t%s\t%s\n", tuple.TupleID, tuple.Key, tuple.Value)
 		hydfs.HandleAppendString(node, line, ts.ProcessedLogFile)
 
 		if outputTuple.Value == "__DROP__" {
@@ -506,15 +539,16 @@ func (w *Worker) AckTuple(args *rss.TupleOutputArgs, reply *bool) error {
 		return fmt.Errorf("task %d not found", args.TaskID)
 	}
 
-	// Mark tuple as acknowledged
+	// Mark tuple as acknowledged using TupleID
 	ts.mu2.Lock()
-	ts.AckedTuples[args.Tuple.Key] = args.Tuple
+	ts.AckedTuples[args.Tuple.TupleID] = args.Tuple
 	ts.mu2.Unlock()
 
-	line := fmt.Sprintf("%s\t%s\n", args.Tuple.Key, args.Tuple.Value)
+	// Write to log with TupleID format: TupleID\tKey\tValue
+	line := fmt.Sprintf("%s\t%s\t%s\n", args.Tuple.TupleID, args.Tuple.Key, args.Tuple.Value)
 	hydfs.HandleAppendString(node, line, ts.AckedLogFile)
 
-	fmt.Printf("Task %d received ack for tuple: %s\n", args.TaskID, args.Tuple.Key)
+	fmt.Printf("Task %d received ack for tuple: %s (TupleID: %s)\n", args.TaskID, args.Tuple.Key, args.Tuple.TupleID)
 	*reply = true
 	return nil
 }
