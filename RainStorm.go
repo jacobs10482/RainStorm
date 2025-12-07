@@ -39,6 +39,7 @@ type TaskState struct {
 	Stdin               io.WriteCloser
 	Stdout              io.ReadCloser
 	InputQueue          chan TupleWithSource
+	FailureChan         chan error
 	ProcessedTuples     map[string]rss.Tuple
 	AckedTuples         map[string]rss.Tuple
 	ProcessedLogFile    string
@@ -128,6 +129,7 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 		InputQueue:          make(chan TupleWithSource, 100), // Buffered channel
 		ProcessedLogFile:    fmt.Sprintf("processed_tuples_%d.log", args.TaskID),
     	AckedLogFile:        fmt.Sprintf("acked_tuples_%d.log", args.TaskID),
+		FailureChan:         make(chan error, 1),
 	}
 	hydfs.HandleCreate(node, "../emptyfile.txt", ts.ProcessedLogFile)
 	hydfs.HandleCreate(node, "../emptyfile.txt", ts.AckedLogFile)
@@ -147,6 +149,8 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 func monitorTaskFailure(ts *TaskState) {
     // Wait for the command to finish
     err := ts.Cmd.Wait()
+
+	ts.FailureChan <- err
 
     if err != nil {
         log.Printf("task %d process exited with error: %v\n", ts.ID, err)
@@ -176,6 +180,16 @@ func monitorAcks(ts *TaskState) {
     defer ticker.Stop()
     
     for range ticker.C {
+		select {
+		case err := <-ts.FailureChan:
+			// Something was sent: exit the goroutine
+			log.Printf("Task %d failed, exiting goroutine: %v", ts.ID, err)
+			return
+		default:
+			// Channel empty: continue normally
+		}
+
+
         // Make a copy of unacked tuples to avoid holding lock during RPC
         unackedTuples := []rss.Tuple{}
         
@@ -249,6 +263,17 @@ func processTuples(ts *TaskState) {
 	scanner := bufio.NewScanner(ts.Stdout)
 	
 	for tupleWithSource := range ts.InputQueue {
+
+		select {
+		case err := <-ts.FailureChan:
+			// Something was sent: exit the goroutine
+			log.Printf("Task %d failed, exiting goroutine: %v", ts.ID, err)
+			return
+		default:
+			// Channel empty: continue normally
+		}
+
+
 		tuple := tupleWithSource.Tuple
 		
 		// Check for duplicates (idempotency)
