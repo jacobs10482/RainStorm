@@ -45,10 +45,12 @@ type TaskState struct {
 	FailureChan         chan error
 	ProcessedTuples     map[string]rss.Tuple // keyed by input TupleID, stores OUTPUT tuple
 	AckedTuples         map[string]rss.Tuple // keyed by input TupleID
+	OutputToInput       map[string]string    // maps output TupleID -> input TupleID (for ack lookup)
 	ProcessedLogFile    string
 	AckedLogFile        string
 	mu1                 sync.RWMutex
 	mu2                 sync.RWMutex
+	mu3                 sync.RWMutex // protects OutputToInput
 	Downstream          []rss.DownstreamInfo
 	InputCount          int64
 	SeqNum              int64 // atomic counter for generating output TupleIDs
@@ -207,6 +209,7 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *int) error {
 		LastStageOutputFile: fmt.Sprintf("last_stage_output_%d.txt", args.TaskID),
 		ProcessedTuples:     recoveredProcessed,
 		AckedTuples:         recoveredAcked,
+		OutputToInput:       make(map[string]string),         // maps output TupleID -> input TupleID
 		InputQueue:          make(chan TupleWithSource, 100), // Buffered channel
 		ProcessedLogFile:    processedLog,
 		AckedLogFile:        ackedLog,
@@ -462,6 +465,11 @@ func processTuples(ts *TaskState) {
 		ts.ProcessedTuples[tuple.TupleID] = outputTuple
 		ts.mu1.Unlock()
 
+		// Store mapping from output TupleID -> input TupleID (for ack lookup)
+		ts.mu3.Lock()
+		ts.OutputToInput[outputTupleID] = tuple.TupleID
+		ts.mu3.Unlock()
+
 		// Write to log: inputTupleID\toutputTupleID\toutputKey\toutputValue (for recovery)
 		line := fmt.Sprintf("%s\t%s\t%s\t%s\n", tuple.TupleID, outputTuple.TupleID, outputTuple.Key, outputTuple.Value)
 		hydfs.HandleAppendString(node, line, ts.ProcessedLogFile)
@@ -564,16 +572,26 @@ func (w *Worker) AckTuple(args *rss.TupleOutputArgs, reply *bool) error {
 		return fmt.Errorf("task %d not found", args.TaskID)
 	}
 
-	// Mark tuple as acknowledged using TupleID
+	// The ack contains the OUTPUT tuple we sent. Look up the INPUT TupleID.
+	ts.mu3.RLock()
+	inputTupleID, found := ts.OutputToInput[args.Tuple.TupleID]
+	ts.mu3.RUnlock()
+
+	if !found {
+		// Fallback: maybe it's already using input TupleID format (legacy or recovery)
+		inputTupleID = args.Tuple.TupleID
+	}
+
+	// Mark as acknowledged using the INPUT TupleID
 	ts.mu2.Lock()
-	ts.AckedTuples[args.Tuple.TupleID] = args.Tuple
+	ts.AckedTuples[inputTupleID] = args.Tuple
 	ts.mu2.Unlock()
 
-	// Write to log with TupleID format: TupleID\tKey\tValue
-	line := fmt.Sprintf("%s\t%s\t%s\n", args.Tuple.TupleID, args.Tuple.Key, args.Tuple.Value)
+	// Write to log with inputTupleID for recovery
+	line := fmt.Sprintf("%s\t%s\t%s\n", inputTupleID, args.Tuple.Key, args.Tuple.Value)
 	hydfs.HandleAppendString(node, line, ts.AckedLogFile)
 
-	fmt.Printf("Task %d received ack for tuple: %s (TupleID: %s)\n", args.TaskID, args.Tuple.Key, args.Tuple.TupleID)
+	fmt.Printf("Task %d received ack for output TupleID %s (input TupleID: %s)\n", args.TaskID, args.Tuple.TupleID, inputTupleID)
 	*reply = true
 	return nil
 }
