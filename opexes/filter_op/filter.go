@@ -14,7 +14,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	pattern := os.Args[1]
+	rawPattern := os.Args[1]
+	pattern := strings.Trim(rawPattern, "\"\u201c\u201d")
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
