@@ -1,68 +1,36 @@
 package main
 
 import (
-	"bufio"
-	"encoding/csv"
-	"fmt"
-	"os"
-	"strings"
+    "bufio"
+    "fmt"
+    "os"
+    "strconv"
+    "strings"
 )
 
 func main() {
+    // We allow an argument (N) to be passed for consistency, 
+    // but we don't strictly require it to be used.
+    // So we just don't check os.Args length strictly or we check >= 1.
 
-	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "Usage: ./aggregate <N>")
-		os.Exit(1)
-	}
+    counts := make(map[string]int)
 
-	// Column index (1-indexed)
-	N := 0
-	fmt.Sscanf(os.Args[1], "%d", &N)
-	if N <= 0 {
-		fmt.Fprintln(os.Stderr, "Column index N must be >= 1")
-		os.Exit(1)
-	}
+    scanner := bufio.NewScanner(os.Stdin)
+    for scanner.Scan() {
+        line := scanner.Text()
+        
+        // Expect input from Filter: <Key> \t <1>
+        parts := strings.SplitN(line, "\t", 2)
+        if len(parts) < 2 { continue }
 
-	counts := make(map[string]int)
+        key := parts[0]
+        valStr := parts[1]
 
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
+        countDelta, _ := strconv.Atoi(valStr)
+        if countDelta == 0 { countDelta = 1 } 
 
-		line := scanner.Text()
+        counts[key] += countDelta
 
-		// Expect: key<TAB>value
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) < 2 {
-			// Malformed input → skip
-			continue
-		}
-
-		value := parts[1]           // full original dataset line
-		r := csv.NewReader(strings.NewReader(value))
-		r.FieldsPerRecord = -1 // allow variable column count
-
-		cols, err := r.Read()
-		if err != nil {
-			// Malformed CSV → skip
-			continue
-		}
-
-		var key string
-		if len(cols) < N {
-			// Missing → empty string
-			key = ""
-		} else {
-			// N is 1-indexed → cols[N-1]
-			key = cols[N-1]
-		}
-
-		// Count occurrences
-		counts[key]++
-		fmt.Printf("%s\t%d\n", key, counts[key])
-	}
-
-	if err := scanner.Err(); err != nil {
-		fmt.Fprintln(os.Stderr, "Error reading stdin:", err)
-	}
-
+        fmt.Printf("%s\t%d\n", key, counts[key])
+    }
 }
