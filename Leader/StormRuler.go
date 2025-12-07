@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 	"sync"
 	fd "g51mp4/failure_detection"
 	hydfs "g51mp4/hydfs_system"
@@ -352,7 +353,7 @@ func (l *Leader) assignAllTasks(cmd *RainStormCommand) error {
 	return nil
 }
 
-func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int) error {
+func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int, inputRate int) error {
 	file, err := os.Open(filename)
 	if err != nil {
 		return fmt.Errorf("failed to open file %s: %v", filename, err)
@@ -361,9 +362,22 @@ func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int) error 
 
 	leaderIP := getLocalIP() + ":9300" // Leader's IP with RPC port
 
+	var ticker *time.Ticker
+    if inputRate > 0 {
+        // Calculate the interval between sends (1 second / rate)
+        // e.g., if rate is 100, interval is 10ms
+        interval := time.Duration(int64(time.Second) / int64(inputRate))
+        ticker = time.NewTicker(interval)
+        defer ticker.Stop()
+        fmt.Printf("Source started with Input Rate: %d tuples/sec\n", inputRate)
+    }
+
 	scanner := bufio.NewScanner(file)
 	lineNum := 0
 	for scanner.Scan() {
+		if inputRate > 0 {
+			<-ticker.C
+		}
 		line := scanner.Text()
 		key := fmt.Sprintf("%s:%d", filename, lineNum)
 		tuple := rss.Tuple{
@@ -537,7 +551,12 @@ func main() {
 		hydfs.HandleCreate(node, "../emptyfile.txt", cmd.HydfsDest)
 		leader.assignAllTasks(cmd)
 
-		leader.ReadFileAndSendTuples(cmd.HydfsSrc, cmd.NtasksPerStage)
+		go func() {
+			err := leader.ReadFileAndSendTuples(cmd.HydfsSrc, cmd.NtasksPerStage, cmd.InputRate)
+			if err != nil {
+				fmt.Printf("Error in source stream: %v\n", err)
+			}
+	   }()
 
 		fmt.Println("Command processed. Enter next command:")
 	}
