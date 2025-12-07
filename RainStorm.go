@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -49,6 +50,7 @@ type TaskState struct {
 	mu1                 sync.RWMutex
 	mu2                 sync.RWMutex
 	Downstream          []rss.DownstreamInfo
+	InputCount          int64
 }
 
 // --------------------------
@@ -216,27 +218,27 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *int) error {
 	return nil
 }
 func (w *Worker) GetTaskStatus(args *rss.GetTaskStatusArgs, reply *rss.GetTaskStatusReply) error {
-    tasksMu.Lock()
-    defer tasksMu.Unlock()
+	tasksMu.Lock()
+	defer tasksMu.Unlock()
 
-    var reports []rss.TaskReport
+	var reports []rss.TaskReport
 
-    for _, ts := range tasks {
-        pid := -1
-        if ts.Cmd != nil && ts.Cmd.Process != nil {
-            pid = ts.Cmd.Process.Pid
-        }
+	for _, ts := range tasks {
+		pid := -1
+		if ts.Cmd != nil && ts.Cmd.Process != nil {
+			pid = ts.Cmd.Process.Pid
+		}
 
-        reports = append(reports, rss.TaskReport{
-            TaskID:  ts.ID,
-            PID:     pid,
-            Exe:     ts.Exe,
-            LogFile: ts.ProcessedLogFile,
-        })
-    }
+		reports = append(reports, rss.TaskReport{
+			TaskID:  ts.ID,
+			PID:     pid,
+			Exe:     ts.Exe,
+			LogFile: ts.ProcessedLogFile,
+		})
+	}
 
-    reply.Reports = reports
-    return nil
+	reply.Reports = reports
+	return nil
 }
 func monitorTaskFailure(ts *TaskState) {
 	// Wait for the command to finish
@@ -508,6 +510,8 @@ func (w *Worker) AddTuples(args *rss.AddTuplesArgs, reply *bool) error {
 
 	// Add tuples to the processing queue
 	for _, t := range args.Tuples {
+		// increment per-task input counter for autoscale metrics
+		atomic.AddInt64(&ts.InputCount, 1)
 		ts.InputQueue <- TupleWithSource{
 			Tuple:      t,
 			SourceIP:   args.SourceIP,
@@ -561,6 +565,49 @@ func (w *Worker) Heartbeat(_ *struct{}, reply *bool) error {
 	return nil
 }
 
+// collectAndReportMetrics runs on each worker and reports per-task input rates
+// to the leader every 2 seconds when tasks have autoscale enabled.
+func collectAndReportMetrics() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// Build metrics per leader address
+		leaderMap := make(map[string][]rss.TaskMetric)
+
+		tasksMu.Lock()
+		for _, ts := range tasks {
+			if !ts.TaskArgs.Autoscale_Enabled {
+				continue
+			}
+			// swap the input count to get number of inputs in last interval
+			cnt := atomic.SwapInt64(&ts.InputCount, 0)
+			rate := float64(cnt) / 2.0
+			leaderAddr := ts.TaskArgs.LeaderIP
+			if leaderAddr == "" {
+				// skip if leader not provided
+				continue
+			}
+			leaderMap[leaderAddr] = append(leaderMap[leaderAddr], rss.TaskMetric{
+				TaskID: ts.ID,
+				Stage:  ts.Stage,
+				Rate:   rate,
+				Worker: getLocalIP() + ":9300",
+			})
+		}
+		tasksMu.Unlock()
+
+		// Send metrics grouped by leader address
+		for leaderAddr, metrics := range leaderMap {
+			args := &rss.MetricsArgs{Metrics: metrics}
+			var reply bool
+			if err := sendRPC(leaderAddr, "Leader.ReportMetrics", args, &reply); err != nil {
+				log.Printf("Failed to send metrics to leader %s: %v", leaderAddr, err)
+			}
+		}
+	}
+}
+
 // --------------------------
 // Main RPC listener
 // --------------------------
@@ -610,6 +657,9 @@ func main() {
 		log.Fatal(err)
 	}
 	fmt.Printf("Worker RPC listening on port %s\n", port)
+
+	// start metrics reporter for autoscale
+	go collectAndReportMetrics()
 
 	for {
 		conn, err := ln.Accept()

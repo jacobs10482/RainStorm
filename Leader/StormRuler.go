@@ -56,10 +56,11 @@ type StageOp struct {
 // --------------------------
 
 type AssignTaskArgs struct {
-	TaskID int
-	Stage  int
-	Exe    string
-	Args   []string
+	TaskID   int
+	Stage    int
+	Exe      string
+	Args     []string
+	LeaderIP string
 }
 
 // --------------------------
@@ -77,6 +78,14 @@ type Leader struct {
 	sentTask        map[string]int       // mapping tuple key -> taskID it was sent to
 	sentMu          sync.RWMutex
 	ExactlyOnce     bool
+	Autoscale       bool
+	Nstages         int
+	Ops             []StageOp
+	StageHW         int
+	StageLW         int
+	activeTasks     map[int][]int   // stage -> list of taskIDs
+	metricsPerTask  map[int]float64 // taskID -> last reported rate
+	metricsMu       sync.Mutex
 	RoundRobinIndex int
 }
 
@@ -103,6 +112,52 @@ func sendRPC(addr string, method string, args interface{}, reply interface{}) er
 	}
 	defer client.Close()
 	return client.Call(method, args, reply)
+}
+
+// monitorMetrics periodically (every 2s) scans the stored per-task metrics,
+// sums rates per stage and logs decisions. It does not perform scaling yet;
+// it only reports what would be done. This keeps autoscale decision logic
+// observable while we implement actual add/remove later.
+func (l *Leader) monitorMetrics() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if !l.Autoscale {
+			return
+		}
+
+		l.metricsMu.Lock()
+		// copy metrics map to avoid holding lock during computation
+		mcopy := make(map[int]float64, len(l.metricsPerTask))
+		for k, v := range l.metricsPerTask {
+			mcopy[k] = v
+		}
+		l.metricsMu.Unlock()
+
+		// For each stage, compute sum over active tasks
+		for stage := 0; stage < l.Nstages; stage++ {
+			l.mu.Lock()
+			ids := append([]int(nil), l.activeTasks[stage]...)
+			l.mu.Unlock()
+
+			sum := 0.0
+			for _, tid := range ids {
+				if r, ok := mcopy[tid]; ok {
+					sum += r
+				}
+			}
+
+			log.Printf("monitorMetrics: stage %d total_rate=%.2f (HW=%d LW=%d)", stage, sum, l.StageHW, l.StageLW)
+
+			// Placeholder: we do not perform scaling yet — just log potential actions
+			if l.StageHW > 0 && sum > float64(l.StageHW) {
+				log.Printf("monitorMetrics: stage %d would add task (sum %.2f > HW %d)", stage, sum, l.StageHW)
+			} else if l.StageLW > 0 && sum < float64(l.StageLW) {
+				log.Printf("monitorMetrics: stage %d would remove task (sum %.2f < LW %d)", stage, sum, l.StageLW)
+			}
+		}
+	}
 }
 
 func (l *Leader) TaskFailed(args *rss.ReviveTaskArgs, reply *bool) error {
@@ -158,11 +213,11 @@ func (l *Leader) TaskFailed(args *rss.ReviveTaskArgs, reply *bool) error {
 	for i, upstreamWorker := range upstreamWorkers {
 		upstreamTaskID := start + i
 		var updateReply bool
-		args := &rss.UpdateDownstreamArgs{
+		args2 := &rss.UpdateDownstreamArgs{
 			TaskID:     upstreamTaskID,
 			Downstream: downstreamInfo,
 		}
-		if err := sendRPC(upstreamWorker, "Worker.UpdateDownstream", args, &updateReply); err != nil {
+		if err := sendRPC(upstreamWorker, "Worker.UpdateDownstream", args2, &updateReply); err != nil {
 			return fmt.Errorf("failed to update upstream task %d on %s: %v", upstreamTaskID, upstreamWorker, err)
 		}
 		if !updateReply {
@@ -262,40 +317,40 @@ func pingWorker(addr string) bool {
 	return callErr == nil && ok
 }
 func (l *Leader) handleListTasks() {
-    l.mu.Lock()
-    currentWorkers := l.workers
-    l.mu.Unlock()
+	l.mu.Lock()
+	currentWorkers := l.workers
+	l.mu.Unlock()
 
-    if len(currentWorkers) == 0 {
-        fmt.Println("No workers connected.")
-        return
-    }
+	if len(currentWorkers) == 0 {
+		fmt.Println("No workers connected.")
+		return
+	}
 
-    fmt.Printf("%-10s %-20s %-10s %-15s %-30s\n", "TaskID", "VM IP", "PID", "Exe", "Log File")
-    fmt.Println(strings.Repeat("-", 90))
+	fmt.Printf("%-10s %-20s %-10s %-15s %-30s\n", "TaskID", "VM IP", "PID", "Exe", "Log File")
+	fmt.Println(strings.Repeat("-", 90))
 
-    for _, workerAddr := range currentWorkers {
-        args := rss.GetTaskStatusArgs{}
-        var reply rss.GetTaskStatusReply
+	for _, workerAddr := range currentWorkers {
+		args := rss.GetTaskStatusArgs{}
+		var reply rss.GetTaskStatusReply
 
-        // Call the worker
-        err := sendRPC(workerAddr, "Worker.GetTaskStatus", &args, &reply)
-        if err != nil {
-            fmt.Printf("Failed to query worker %s: %v\n", workerAddr, err)
-            continue
-        }
+		// Call the worker
+		err := sendRPC(workerAddr, "Worker.GetTaskStatus", &args, &reply)
+		if err != nil {
+			fmt.Printf("Failed to query worker %s: %v\n", workerAddr, err)
+			continue
+		}
 
-        for _, report := range reply.Reports {
-            fmt.Printf("%-10d %-20s %-10d %-15s %-30s\n", 
-                report.TaskID, 
-                workerAddr, 
-                report.PID, 
-                report.Exe, 
-                report.LogFile,
-            )
-        }
-    }
-    fmt.Println(strings.Repeat("-", 90))
+		for _, report := range reply.Reports {
+			fmt.Printf("%-10d %-20s %-10d %-15s %-30s\n",
+				report.TaskID,
+				workerAddr,
+				report.PID,
+				report.Exe,
+				report.LogFile,
+			)
+		}
+	}
+	fmt.Println(strings.Repeat("-", 90))
 }
 func parseRainStormCommand(line string) (*RainStormCommand, error) {
 	parts := strings.Fields(line)
@@ -429,6 +484,7 @@ func (l *Leader) assignAllTasks(cmd *RainStormCommand) error {
 				Dest:              cmd.HydfsDest,
 				Exe:               cmd.Ops[stage].Exe,
 				Args:              cmd.Ops[stage].Args,
+				LeaderIP:          getLocalIP() + ":9300",
 				Downstream:        downstream,
 				Exactly_Once:      cmd.ExactlyOnce,
 				Autoscale_Enabled: cmd.Autoscale,
@@ -589,7 +645,6 @@ func main() {
 		RoundRobinIndex: 0,
 	}
 
-
 	// Register leader RPC
 	rpc.Register(leader)
 
@@ -698,6 +753,12 @@ func main() {
 		leader.ExactlyOnce = cmd.ExactlyOnce
 		if leader.ExactlyOnce {
 			go leader.monitorSent()
+		}
+
+		// Configure Autoscale behavior and start metrics monitor if enabled
+		leader.Autoscale = cmd.Autoscale
+		if leader.Autoscale {
+			go leader.monitorMetrics()
 		}
 
 		go func() {

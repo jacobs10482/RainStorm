@@ -2,84 +2,93 @@ package rainstormrpc
 
 import "hash/fnv"
 
-
 func HashKey(key string) uint32 {
-    h := fnv.New32a()
-    h.Write([]byte(key))
-    return h.Sum32()
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return h.Sum32()
 }
 
-
 type Tuple struct {
-    Key   string
-    Value string
-    //TupleID int64
+	Key   string
+	Value string
+	//TupleID int64
 }
 
 type AssignTaskArgs struct {
-    TaskID        int
-    Stage         int
-    Exe           string
-    Args          string
-    Dest          string
-    Downstream []DownstreamInfo
-    Exactly_Once   bool
-    Autoscale_Enabled bool
-    InputRate   int
-    LW          int
-    HW          int
+	TaskID            int
+	Stage             int
+	Exe               string
+	Args              string
+	Dest              string
+	Downstream        []DownstreamInfo
+	LeaderIP          string
+	Exactly_Once      bool
+	Autoscale_Enabled bool
+	InputRate         int
+	LW                int
+	HW                int
 }
 
 type DownstreamInfo struct {
-    TaskID    int
-    IP    string  // "ip:port"
+	TaskID int
+	IP     string // "ip:port"
 }
 
 type AddTuplesArgs struct {
-    TaskID int
-    Tuples []Tuple
-    SourceIP   string
-    SourceTask int
+	TaskID     int
+	Tuples     []Tuple
+	SourceIP   string
+	SourceTask int
 }
 
 type ReviveTaskArgs struct {
-    Args    *AssignTaskArgs
+	Args *AssignTaskArgs
 }
 
 type KillTaskArgs struct {
-    TaskID    int
+	TaskID int
 }
 
 type TupleOutputArgs struct {
-    TaskID int
-    Stage  int
-    Tuple  Tuple
+	TaskID int
+	Stage  int
+	Tuple  Tuple
 }
 
 type UpdateDownstreamArgs struct {
-    TaskID     int
-    Downstream DownstreamInfo
+	TaskID     int
+	Downstream DownstreamInfo
 }
 
-
 type TaskIPAndPID struct {
-    IP  string
-    PID int
+	IP  string
+	PID int
+}
+
+type TaskMetric struct {
+	TaskID int
+	Stage  int
+	Rate   float64
+	Worker string
+}
+
+type MetricsArgs struct {
+	Metrics []TaskMetric
 }
 
 // In RainStormStructs package
 
 type TaskReport struct {
-    TaskID   int
-    PID      int
-    Exe      string
-    LogFile  string
+	TaskID  int
+	PID     int
+	Exe     string
+	LogFile string
 }
 
 type GetTaskStatusArgs struct {
-    // Empty, we just want everything
+	// Empty, we just want everything
 }
 
 type GetTaskStatusReply struct {
-    Reports []TaskReport
+	Reports []TaskReport
 }
