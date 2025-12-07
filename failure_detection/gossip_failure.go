@@ -68,7 +68,7 @@ func (n *Node) AddOrUpdate(m *Member) {
 			case n.JoinCh <- m.NodeID:
 			default:
 				log.Printf("JoinCh full, dropped dead notification for %s", m.NodeID)
-			}	
+			}
 			log.Printf("JOINED: %s\n", m.NodeID)
 		}
 		return
@@ -132,7 +132,7 @@ func (ml *MembershipList) CleanupDead(node *Node, timeout time.Duration, deathti
 			case node.FailCh <- m.NodeID:
 			default:
 				log.Printf("FailCh full, dropped dead notification for %s", m.NodeID)
-			}		
+			}
 			delete(ml.members, m.NodeID)
 			continue
 		}
@@ -141,7 +141,7 @@ func (ml *MembershipList) CleanupDead(node *Node, timeout time.Duration, deathti
 		if m.Status == Suspect && now.Sub(m.SuspectTimer) > timeout {
 			m.Status = Dead
 			m.SuspectTimer = now
-			log.Printf("Updating status to %s: %s\n", m.Status, m.NodeID)	
+			log.Printf("Updating status to %s: %s\n", m.Status, m.NodeID)
 		}
 
 	}
@@ -235,15 +235,14 @@ func (n *Node) Gossip() {
 		}
 	}
 
-
 	snapshot := make(map[string]*Member, len(n.Membership.members))
-    for k, v := range n.Membership.members {
-        copyMember := *v
-        snapshot[k] = &copyMember
-    }
+	for k, v := range n.Membership.members {
+		copyMember := *v
+		snapshot[k] = &copyMember
+	}
 
-    // Unlock ASAP to avoid blocking writers
-    n.Membership.mu.Unlock()
+	// Unlock ASAP to avoid blocking writers
+	n.Membership.mu.Unlock()
 
 	if len(peers) < 1 {
 		return // no one to gossip to
@@ -298,24 +297,23 @@ func (n *Node) IncrementHeartbeat() {
 // CheckSuspicion monitors nodes for failure detection
 // Marks nodes as suspect based on heartbeat timeout (always uses suspicion mode)
 func (n *Node) CheckSuspicion() {
-    now := time.Now()
+	now := time.Now()
 
-    n.Membership.mu.Lock()
-    //Make a copy of members to safely iterate
-    snapshot := make([]*Member, 0, len(n.Membership.members))
-    for _, m := range n.Membership.members {
-        snapshot = append(snapshot, m)
-    }
-    n.Membership.mu.Unlock()
+	n.Membership.mu.Lock()
+	//Make a copy of members to safely iterate
+	snapshot := make([]*Member, 0, len(n.Membership.members))
+	for _, m := range n.Membership.members {
+		snapshot = append(snapshot, m)
+	}
+	n.Membership.mu.Unlock()
 
-    for _, m := range snapshot {
-        if m.Status == Alive && now.Sub(m.LastHeartbeat) > n.FailureTimeout {
-            // MarkSuspect likely modifies the map — so take the write lock there
-            n.Membership.MarkSuspect(m.NodeID)
-        }
-    }
+	for _, m := range snapshot {
+		if m.Status == Alive && now.Sub(m.LastHeartbeat) > n.FailureTimeout {
+			// MarkSuspect likely modifies the map — so take the write lock there
+			n.Membership.MarkSuspect(m.NodeID)
+		}
+	}
 }
-
 
 // Run starts the main node operation loop
 // Launches listener goroutines and executes gossip protocol
@@ -531,16 +529,16 @@ func InitializeFailureDetection() *Node {
 		"172.22.158.171:9000",
 		"172.22.95.101:9000",
 	}
-/*
-	// Find the index of this node in the VM list for logging
-	idx := -1
-	for i, v := range vms {
-		if v == (string(selfIP) + ":9000") {
-			idx = i + 1
-			break
+	/*
+		// Find the index of this node in the VM list for logging
+		idx := -1
+		for i, v := range vms {
+			if v == (string(selfIP) + ":9000") {
+				idx = i + 1
+				break
+			}
 		}
-	}
-*/
+	*/
 	// Set up logging to both console and file
 	//filename := fmt.Sprintf("machine.%02d.log", idx)
 
@@ -573,9 +571,7 @@ func InitializeFailureDetection() *Node {
 	return node
 }
 
-
-
-//NEW MP3 STUFF
+// NEW MP3 STUFF
 func (ml *MembershipList) NodeIDs() []string {
 	ml.mu.Lock()
 	defer ml.mu.Unlock()

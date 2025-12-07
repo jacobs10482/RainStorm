@@ -260,8 +260,11 @@ func (l *Leader) removeTaskFromStage(stage int) error {
 	l.mu.Lock()
 	ids := l.activeTasks[stage]
 	if len(ids) <= 1 {
+		// Do not remove the last task in a stage. Return nil so callers
+		// treat this as a no-op rather than a fatal error.
+		log.Printf("removeTaskFromStage: skipping removal for stage %d because only %d task(s) remain", stage, len(ids))
 		l.mu.Unlock()
-		return fmt.Errorf("cannot remove task: only %d tasks in stage %d", len(ids), stage)
+		return nil
 	}
 
 	// Remove last task in the list
@@ -281,17 +284,44 @@ func (l *Leader) removeTaskFromStage(stage int) error {
 	delete(l.metricsPerTask, taskToRemove)
 	l.metricsMu.Unlock()
 
-	// Kill the task on the worker
-	var reply bool
-	if err := sendRPC(wp.IP, "Worker.KillTask", &rss.KillTaskArgs{TaskID: taskToRemove}, &reply); err != nil {
-		log.Printf("removeTaskFromStage: failed to kill task %d: %v", taskToRemove, err)
-	}
-
 	// Update upstream tasks with new downstream list (without the removed task)
 	if stage > 0 {
 		if err := l.updateUpstreamDownstreams(stage); err != nil {
 			log.Printf("removeTaskFromStage: failed to update upstream for stage %d: %v", stage, err)
 		}
+	}
+
+	// Wait for the worker to drain its input queue before killing the task.
+	// Poll the worker via Worker.GetQueueLen RPC. If the RPC fails or a
+	// timeout elapses, proceed to kill to avoid indefinite waits.
+	drained := false
+	timeout := time.After(30 * time.Second)
+	pollTicker := time.NewTicker(500 * time.Millisecond)
+	for !drained {
+		select {
+		case <-timeout:
+			log.Printf("removeTaskFromStage: timeout waiting for task %d to drain; proceeding to kill", taskToRemove)
+			drained = true
+		case <-pollTicker.C:
+			var qreply rss.QueueLenReply
+			if err := sendRPC(wp.IP, "Worker.GetQueueLen", &rss.GetQueueLenArgs{TaskID: taskToRemove}, &qreply); err != nil {
+				log.Printf("removeTaskFromStage: failed to query queue length for task %d at %s: %v; proceeding to kill", taskToRemove, wp.IP, err)
+				drained = true
+				break
+			}
+			if qreply.Length == 0 {
+				drained = true
+				break
+			}
+			log.Printf("removeTaskFromStage: waiting for task %d to drain; queue length=%d", taskToRemove, qreply.Length)
+		}
+	}
+	pollTicker.Stop()
+
+	// Kill the task on the worker
+	var reply bool
+	if err := sendRPC(wp.IP, "Worker.KillTask", &rss.KillTaskArgs{TaskID: taskToRemove}, &reply); err != nil {
+		log.Printf("removeTaskFromStage: failed to kill task %d: %v", taskToRemove, err)
 	}
 
 	log.Printf("removeTaskFromStage: removed task %d from stage %d", taskToRemove, stage)
@@ -575,7 +605,6 @@ func parseRainStormCommand(line string) (*RainStormCommand, error) {
 		return nil, fmt.Errorf("not enough arguments for stages and parameters")
 	}
 
-
 	fmt.Printf("Stages: %d\n", nStages)
 	ops := make([]StageOp, nStages)
 	for i := 0; i < nStages; i++ {
@@ -748,14 +777,27 @@ func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int, inputR
 			Value: line,
 		}
 
-		// Hash key to pick stage 1 task
-		taskIdx := int(rss.HashKey(tuple.Key)) % nTasksStage1
-		taskID := taskID(0, taskIdx, nTasksStage1) // assuming stage 0 = first stage
-		worker, ok := l.taskMapping[taskID]
-		workerAddr := worker.IP
+		// Choose stage-1 task from the current live list instead of relying
+		// on a static numbering. This ensures autoscale (add/remove tasks)
+		// doesn't cause the leader to send keys to the wrong task.
+		l.mu.Lock()
+		stage1IDs := append([]int(nil), l.activeTasks[0]...)
+		l.mu.Unlock()
+
+		if len(stage1IDs) == 0 {
+			return fmt.Errorf("no active tasks in stage 0 to send tuples to")
+		}
+
+		idx := int(rss.HashKey(tuple.Key)) % len(stage1IDs)
+		taskID := stage1IDs[idx]
+
+		l.mu.Lock()
+		wp, ok := l.taskMapping[taskID]
+		l.mu.Unlock()
 		if !ok {
 			return fmt.Errorf("no worker assigned for task %d", taskID)
 		}
+		workerAddr := wp.IP
 
 		// Send the tuple via RPC - Leader provides its IP for ack-back
 		args := rss.AddTuplesArgs{

@@ -93,3 +93,12 @@ type GetTaskStatusArgs struct {
 type GetTaskStatusReply struct {
 	Reports []TaskReport
 }
+
+// Request to get the current length of a task's input queue on the worker.
+type GetQueueLenArgs struct {
+	TaskID int
+}
+
+type QueueLenReply struct {
+	Length int
+}

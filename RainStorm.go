@@ -409,9 +409,9 @@ func processTuples(ts *TaskState) {
 		hydfs.HandleAppendString(node, line, ts.ProcessedLogFile)
 
 		if outputTuple.Value == "__DROP__" {
-				// Just ack back to the source (filtered out)
-				sendAck(tupleWithSource.SourceIP, tupleWithSource.SourceTask, tuple)
-				continue
+			// Just ack back to the source (filtered out)
+			sendAck(tupleWithSource.SourceIP, tupleWithSource.SourceTask, tuple)
+			continue
 		}
 
 		// Handle final stage vs intermediate stage
@@ -563,6 +563,21 @@ func (w *Worker) KillTask(args *rss.KillTaskArgs, reply *bool) error {
 	ts.Stdout.Close()
 
 	*reply = true
+	return nil
+}
+
+// GetQueueLen returns the current length of the input queue for the given task.
+func (w *Worker) GetQueueLen(args *rss.GetQueueLenArgs, reply *rss.QueueLenReply) error {
+	tasksMu.Lock()
+	ts, ok := tasks[args.TaskID]
+	tasksMu.Unlock()
+
+	if !ok {
+		return fmt.Errorf("task %d not found", args.TaskID)
+	}
+
+	// len(channel) gives the number of queued items
+	reply.Length = len(ts.InputQueue)
 	return nil
 }
 

@@ -18,7 +18,7 @@ func main() {
     scanner := bufio.NewScanner(os.Stdin)
     for scanner.Scan() {
         line := scanner.Text()
-        
+
         // Expect input from Filter: <Key> \t <1>
         parts := strings.SplitN(line, "\t", 2)
         if len(parts) < 2 { continue }
