@@ -60,3 +60,9 @@ type UpdateDownstreamArgs struct {
     TaskID     int
     Downstream DownstreamInfo
 }
+
+
+type TaskIPAndPID struct {
+    IP  string
+    PID int
+}

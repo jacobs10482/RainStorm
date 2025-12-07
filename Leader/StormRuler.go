@@ -69,7 +69,7 @@ type AssignTaskArgs struct {
 type Leader struct {
 	mu              sync.Mutex
 	workers         []string              // set of alive workers
-	taskMapping     map[int]string        // taskID → worker addr
+	taskMapping     map[int]rss.TaskIPAndPID        // taskID → worker addr
 	tupleBuffer     map[int][]rss.Tuple
 	ackedTuples     map[string]rss.Tuple  // Track acked tuples from stage 1
 	ackedMu         sync.RWMutex
@@ -112,17 +112,17 @@ func (l *Leader) TaskFailed(args *rss.ReviveTaskArgs, reply *bool) error {
     l.mu.Unlock()
 
     // Step 1: assign task on chosen worker (do network I/O WITHOUT holding leader lock)
-    var assignReply bool
+    var assignReply int
     if err := sendRPC(worker, "Worker.AssignTask", arg, &assignReply); err != nil {
         return fmt.Errorf("assigning task %d to %s failed: %v", arg.TaskID, worker, err)
     }
-    if !assignReply {
+    if assignReply == 0 {
         return fmt.Errorf("worker %s rejected revive for task %d", worker, arg.TaskID)
     }
 
     // Step 2: update leader's mapping for the revived task (hold lock)
     l.mu.Lock()
-    l.taskMapping[arg.TaskID] = worker
+    l.taskMapping[arg.TaskID] = rss.TaskIPAndPID{IP: worker, PID: assignReply}
     // If revived task is in stage 0 (the first stage), do leader-only map fix
 
     if arg.Stage == 0 {
@@ -144,7 +144,7 @@ func (l *Leader) TaskFailed(args *rss.ReviveTaskArgs, reply *bool) error {
             l.mu.Unlock()
             return fmt.Errorf("no worker mapping for upstream task %d", upstreamID)
         }
-        upstreamWorkers = append(upstreamWorkers, w)
+        upstreamWorkers = append(upstreamWorkers, w.IP)
     }
     l.mu.Unlock()
 
@@ -340,13 +340,13 @@ func (l *Leader) assignAllTasks(cmd *RainStormCommand) error {
 			}
 
 			// Perform RPC
-			var reply bool
+			var reply int
 			if err := sendRPC(worker, "Worker.AssignTask", args, &reply); err != nil {
 				return fmt.Errorf("assigning task %d to %s failed: %v", tid, worker, err)
 			}
 
 			// Save mapping
-			l.taskMapping[tid] = worker
+			l.taskMapping[tid] = rss.TaskIPAndPID{IP: worker, PID: reply}
 		}
 	}
 
@@ -388,7 +388,8 @@ func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int, inputR
 		// Hash key to pick stage 1 task
 		taskIdx := int(rss.HashKey(tuple.Key)) % nTasksStage1
 		taskID := taskID(0, taskIdx, nTasksStage1) // assuming stage 0 = first stage
-		workerAddr, ok := l.taskMapping[taskID]
+		worker, ok := l.taskMapping[taskID]
+		workerAddr := worker.IP
 		if !ok {
 			return fmt.Errorf("no worker assigned for task %d", taskID)
 		}
@@ -476,7 +477,7 @@ func main() {
 
 	leader := &Leader{
 		workers:     nil,                       // start empty
-		taskMapping: make(map[int]string),      // taskID → worker
+		taskMapping: make(map[int]rss.TaskIPAndPID),      // taskID → worker
 		tupleBuffer: make(map[int][]rss.Tuple), // in-flight tuples
 		ackedTuples: make(map[string]rss.Tuple), // tuples acked by stage 1
 		RoundRobinIndex: 0,

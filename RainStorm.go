@@ -128,7 +128,7 @@ func loadStateFromHyDFS(logFilename string) (map[string]rss.Tuple, error) {
     return stateMap, nil
 }
 
-func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
+func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *int) error {
 	tasksMu.Lock()
 	defer tasksMu.Unlock()
 
@@ -192,7 +192,8 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 	go monitorAcks(ts)
 	go monitorTaskFailure(ts)
 
-	*reply = true
+	*reply = cmd.Process.Pid
+
 	return nil
 }
 func monitorTaskFailure(ts *TaskState) {
