@@ -141,8 +141,6 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *int) error {
 		argList = strings.Fields(args.Args)
 	}
 
-	
-
 	cmd := exec.Command(args.Exe, argList...)
 
 	stdin, err := cmd.StdinPipe()
@@ -413,6 +411,13 @@ func processTuples(ts *TaskState) {
 		// Handle final stage vs intermediate stage
 		if len(ts.Downstream) == 0 {
 			// Final stage - write to HyDFS
+			// If operator signalled a filtered/dropped tuple, don't write to HyDFS
+			if outputTuple.Value == "__DROP__" {
+				// Just ack back to the source (filtered out)
+				sendAck(tupleWithSource.SourceIP, tupleWithSource.SourceTask, tuple)
+				continue
+			}
+
 			fmt.Printf("%s\t%s\n", outputTuple.Key, outputTuple.Value)
 
 			lineOutput := fmt.Sprintf("%s\t%s\n", outputTuple.Key, outputTuple.Value)
@@ -441,6 +446,12 @@ func processTuples(ts *TaskState) {
 				)
 
 				if err == nil {
+					// Successfully forwarded, now send ack back to our source
+					// If the operator produced a drop marker, don't forward (ack only)
+					if outputTuple.Value == "__DROP__" {
+						sendAck(tupleWithSource.SourceIP, tupleWithSource.SourceTask, tuple)
+						break
+					}
 					// Successfully forwarded, now send ack back to our source
 					sendAck(tupleWithSource.SourceIP, tupleWithSource.SourceTask, tuple)
 					break
