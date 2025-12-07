@@ -380,8 +380,14 @@ func (l *Leader) TaskFailed(args *rss.ReviveTaskArgs, reply *bool) error {
 	l.mu.Lock()
 	arg := args.Args
 
+	// Check if we have workers available
+	if len(l.workers) == 0 {
+		l.mu.Unlock()
+		return fmt.Errorf("no workers available to revive task %d", arg.TaskID)
+	}
+
 	// pick worker (round-robin)
-	worker := l.workers[l.RoundRobinIndex]
+	worker := l.workers[l.RoundRobinIndex%len(l.workers)]
 	// advance round-robin for next time
 	l.RoundRobinIndex = (l.RoundRobinIndex + 1) % len(l.workers)
 	l.mu.Unlock()

@@ -43,8 +43,8 @@ type TaskState struct {
 	Stdout              io.ReadCloser
 	InputQueue          chan TupleWithSource
 	FailureChan         chan error
-	ProcessedTuples     map[string]rss.Tuple // keyed by TupleID
-	AckedTuples         map[string]rss.Tuple // keyed by TupleID
+	ProcessedTuples     map[string]rss.Tuple // keyed by input TupleID, stores OUTPUT tuple
+	AckedTuples         map[string]rss.Tuple // keyed by input TupleID
 	ProcessedLogFile    string
 	AckedLogFile        string
 	mu1                 sync.RWMutex
@@ -135,9 +135,25 @@ func loadStateFromHyDFS(logFilename string) (map[string]rss.Tuple, error) {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		// Parse the tuple using helper - now uses TupleID as key
-		tuple := parseTuple(line)
-		if tuple.TupleID != "" {
+		// Parse log format: inputTupleID\toutputTupleID\toutputKey\toutputValue
+		// OR legacy 3-field format: TupleID\tKey\tValue (for acked tuples)
+		parts := strings.SplitN(line, "\t", 4)
+		if len(parts) == 4 {
+			// 4-field format: store output tuple keyed by input TupleID
+			inputTupleID := parts[0]
+			outputTuple := rss.Tuple{
+				TupleID: parts[1],
+				Key:     parts[2],
+				Value:   parts[3],
+			}
+			stateMap[inputTupleID] = outputTuple
+		} else if len(parts) == 3 {
+			// 3-field format (acked tuples): TupleID\tKey\tValue
+			tuple := rss.Tuple{
+				TupleID: parts[0],
+				Key:     parts[1],
+				Value:   parts[2],
+			}
 			stateMap[tuple.TupleID] = tuple
 		}
 	}
@@ -273,8 +289,12 @@ func monitorTaskFailure(ts *TaskState) {
 
 	var reply bool
 	args := &rss.ReviveTaskArgs{Args: &ts.TaskArgs}
-	// call leader's TaskFailed RPC
-	if rpcErr := sendRPC("172.22.95.98:9300", "Leader.TaskFailed", args, &reply); rpcErr != nil {
+	// call leader's TaskFailed RPC using the stored LeaderIP
+	leaderIP := ts.TaskArgs.LeaderIP
+	if leaderIP == "" {
+		leaderIP = "172.22.95.98:9300" // fallback
+	}
+	if rpcErr := sendRPC(leaderIP, "Leader.TaskFailed", args, &reply); rpcErr != nil {
 		log.Printf("Failed to notify leader about task %d: %v\n", ts.ID, rpcErr)
 	} else {
 		log.Printf("Notified leader that task %d failed\n", ts.ID)
@@ -297,43 +317,48 @@ func monitorAcks(ts *TaskState) {
 		}
 
 		// Make a copy of unacked tuples to avoid holding lock during RPC
-		unackedTuples := []rss.Tuple{}
+		// Store both inputTupleID and outputTuple for resend
+		type unackedEntry struct {
+			inputTupleID string
+			outputTuple  rss.Tuple
+		}
+		unackedTuples := []unackedEntry{}
 
 		ts.mu1.RLock()
 		ts.mu2.RLock()
-		for tupleID, tuple := range ts.ProcessedTuples {
-			if _, acked := ts.AckedTuples[tupleID]; !acked {
-				unackedTuples = append(unackedTuples, tuple)
+		for inputTupleID, outputTuple := range ts.ProcessedTuples {
+			if _, acked := ts.AckedTuples[inputTupleID]; !acked {
+				unackedTuples = append(unackedTuples, unackedEntry{inputTupleID, outputTuple})
 			}
 		}
 		ts.mu2.RUnlock()
 		ts.mu1.RUnlock()
 
 		// Now resend without holding locks
-		for _, tuple := range unackedTuples {
+		for _, entry := range unackedTuples {
 			// Double-check it's still unacked (might have been acked during copy)
 			ts.mu2.RLock()
-			_, acked := ts.AckedTuples[tuple.TupleID]
+			_, acked := ts.AckedTuples[entry.inputTupleID] // Use inputTupleID, not output's TupleID
 			ts.mu2.RUnlock()
 
 			if acked {
 				continue // Got acked while we were copying, skip it
 			}
 
-			log.Printf("Task %d: Tuple %s (TupleID: %s) not acked, resending", ts.ID, tuple.Key, tuple.TupleID)
+			log.Printf("Task %d: Tuple %s (TupleID: %s) not acked, resending output", ts.ID, entry.outputTuple.Key, entry.outputTuple.TupleID)
 
 			if len(ts.Downstream) == 0 {
 				continue // Final stage, nothing to resend to
 			}
 
-			idx := int(HashKey(tuple.Key)) % len(ts.Downstream)
+			idx := int(HashKey(entry.outputTuple.Key)) % len(ts.Downstream)
 			target := ts.Downstream[idx]
 
 			var dummyReply bool
 			err := sendRPC(target.IP, "Worker.AddTuples",
 				&rss.AddTuplesArgs{
 					TaskID:     target.TaskID,
-					Tuples:     []rss.Tuple{tuple},
+					Tuples:     []rss.Tuple{entry.outputTuple},
 					SourceIP:   getLocalIP() + ":9300",
 					SourceTask: ts.ID,
 				},
@@ -341,7 +366,7 @@ func monitorAcks(ts *TaskState) {
 			)
 
 			if err != nil {
-				log.Printf("Task %d: Failed to resend tuple %s: %v", ts.ID, tuple.TupleID, err)
+				log.Printf("Task %d: Failed to resend tuple %s: %v", ts.ID, entry.outputTuple.TupleID, err)
 				// Could notify leader of downstream failure here
 			}
 		}
@@ -432,13 +457,13 @@ func processTuples(ts *TaskState) {
 			Value:   outputValue,
 		}
 
-		// Mark input as processed using TupleID
+		// Store OUTPUT tuple keyed by INPUT TupleID for resend if not acked
 		ts.mu1.Lock()
-		ts.ProcessedTuples[tuple.TupleID] = tuple
+		ts.ProcessedTuples[tuple.TupleID] = outputTuple
 		ts.mu1.Unlock()
 
-		// Write to log with TupleID format: TupleID\tKey\tValue
-		line := fmt.Sprintf("%s\t%s\t%s\n", tuple.TupleID, tuple.Key, tuple.Value)
+		// Write to log: inputTupleID\toutputTupleID\toutputKey\toutputValue (for recovery)
+		line := fmt.Sprintf("%s\t%s\t%s\t%s\n", tuple.TupleID, outputTuple.TupleID, outputTuple.Key, outputTuple.Value)
 		hydfs.HandleAppendString(node, line, ts.ProcessedLogFile)
 
 		if outputTuple.Value == "__DROP__" {
