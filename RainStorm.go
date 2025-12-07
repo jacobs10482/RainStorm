@@ -448,6 +448,24 @@ func processTuples(ts *TaskState) {
 			Value:   outputValue,
 		}
 
+		// Check for __DROP__ BEFORE storing in ProcessedTuples
+		// This prevents monitorAcks from resending dropped tuples to downstream
+		if outputTuple.Value == "__DROP__" {
+			// Mark as processed but don't store for resend (ack immediately)
+			ts.mu1.Lock()
+			ts.ProcessedTuples[tuple.TupleID] = outputTuple
+			ts.mu1.Unlock()
+
+			// Mark as acked immediately so monitorAcks doesn't resend
+			ts.mu2.Lock()
+			ts.AckedTuples[tuple.TupleID] = outputTuple
+			ts.mu2.Unlock()
+
+			// Just ack back to the source (filtered out), don't forward
+			sendAck(tupleWithSource.SourceIP, tupleWithSource.SourceTask, tuple)
+			continue
+		}
+
 		// Store OUTPUT tuple keyed by TupleID for resend if not acked
 		ts.mu1.Lock()
 		ts.ProcessedTuples[tuple.TupleID] = outputTuple
@@ -457,16 +475,9 @@ func processTuples(ts *TaskState) {
 		line := fmt.Sprintf("%s\t%s\t%s\n", tuple.TupleID, outputTuple.Key, outputTuple.Value)
 		hydfs.HandleAppendString(node, line, ts.ProcessedLogFile)
 
-		if outputTuple.Value == "__DROP__" {
-			// Just ack back to the source (filtered out)
-			sendAck(tupleWithSource.SourceIP, tupleWithSource.SourceTask, tuple)
-			continue
-		}
-
 		// Handle final stage vs intermediate stage
 		if len(ts.Downstream) == 0 {
 			// Final stage - write to HyDFS
-			// If operator signalled a filtered/dropped tuple, don't write to HyDFS
 
 			fmt.Printf("%s\t%s\n", outputTuple.Key, outputTuple.Value)
 
