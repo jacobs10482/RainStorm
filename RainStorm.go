@@ -381,7 +381,7 @@ func processTuples(ts *TaskState) {
 		}
 		ts.mu1.RUnlock()
 
-		//fmt.Printf("Input Tuple: %s, Value: %s\n", tuple.Key, tuple.Value)
+		fmt.Printf("Input Tuple: %s, Value: %s\n", tuple.Key, tuple.Value)
 		// Write tuple to operator's stdin
 		_, err := fmt.Fprintf(ts.Stdin, "%s\t%s\n", tuple.Key, tuple.Value)
 		if err != nil {
