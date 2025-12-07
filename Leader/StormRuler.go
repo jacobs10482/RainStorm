@@ -4,16 +4,16 @@ import (
 	"bufio"
 	"fmt"
 	rss "g51mp4/RainStormStructs"
+	fd "g51mp4/failure_detection"
+	hydfs "g51mp4/hydfs_system"
 	"log"
 	"net"
 	"net/rpc"
 	"os"
 	"strconv"
 	"strings"
-	"time"
 	"sync"
-	fd "g51mp4/failure_detection"
-	hydfs "g51mp4/hydfs_system"
+	"time"
 )
 
 var node *fd.Node
@@ -34,16 +34,16 @@ var vmMapRPC = map[string]string{
 var tasksPerStage int = 0
 
 type RainStormCommand struct {
-	Nstages         int
-	NtasksPerStage  int
-	Ops             []StageOp
-	HydfsSrc        string
-	HydfsDest       string
-	ExactlyOnce     bool
-	Autoscale       bool
-	InputRate       int
-	LW              int
-	HW              int
+	Nstages        int
+	NtasksPerStage int
+	Ops            []StageOp
+	HydfsSrc       string
+	HydfsDest      string
+	ExactlyOnce    bool
+	Autoscale      bool
+	InputRate      int
+	LW             int
+	HW             int
 }
 
 type StageOp struct {
@@ -68,11 +68,15 @@ type AssignTaskArgs struct {
 
 type Leader struct {
 	mu              sync.Mutex
-	workers         []string              // set of alive workers
-	taskMapping     map[int]rss.TaskIPAndPID        // taskID → worker addr
+	workers         []string                 // set of alive workers
+	taskMapping     map[int]rss.TaskIPAndPID // taskID → worker addr
 	tupleBuffer     map[int][]rss.Tuple
-	ackedTuples     map[string]rss.Tuple  // Track acked tuples from stage 1
+	ackedTuples     map[string]rss.Tuple // Track acked tuples from stage 1
 	ackedMu         sync.RWMutex
+	sentTuples      map[string]rss.Tuple // Track tuples sent by leader (for resends)
+	sentTask        map[string]int       // mapping tuple key -> taskID it was sent to
+	sentMu          sync.RWMutex
+	ExactlyOnce     bool
 	RoundRobinIndex int
 }
 
@@ -102,79 +106,138 @@ func sendRPC(addr string, method string, args interface{}, reply interface{}) er
 }
 
 func (l *Leader) TaskFailed(args *rss.ReviveTaskArgs, reply *bool) error {
-    l.mu.Lock()
-    arg := args.Args
+	l.mu.Lock()
+	arg := args.Args
 
-    // pick worker (round-robin)
-    worker := l.workers[l.RoundRobinIndex]
-    // advance round-robin for next time
-    l.RoundRobinIndex = (l.RoundRobinIndex + 1) % len(l.workers)
-    l.mu.Unlock()
+	// pick worker (round-robin)
+	worker := l.workers[l.RoundRobinIndex]
+	// advance round-robin for next time
+	l.RoundRobinIndex = (l.RoundRobinIndex + 1) % len(l.workers)
+	l.mu.Unlock()
 
-    // Step 1: assign task on chosen worker (do network I/O WITHOUT holding leader lock)
-    var assignReply int
-    if err := sendRPC(worker, "Worker.AssignTask", arg, &assignReply); err != nil {
-        return fmt.Errorf("assigning task %d to %s failed: %v", arg.TaskID, worker, err)
-    }
-    if assignReply == 0 {
-        return fmt.Errorf("worker %s rejected revive for task %d", worker, arg.TaskID)
-    }
+	// Step 1: assign task on chosen worker (do network I/O WITHOUT holding leader lock)
+	var assignReply int
+	if err := sendRPC(worker, "Worker.AssignTask", arg, &assignReply); err != nil {
+		return fmt.Errorf("assigning task %d to %s failed: %v", arg.TaskID, worker, err)
+	}
+	if assignReply == 0 {
+		return fmt.Errorf("worker %s rejected revive for task %d", worker, arg.TaskID)
+	}
 
-    // Step 2: update leader's mapping for the revived task (hold lock)
-    l.mu.Lock()
-    l.taskMapping[arg.TaskID] = rss.TaskIPAndPID{IP: worker, PID: assignReply}
-    // If revived task is in stage 0 (the first stage), do leader-only map fix
+	// Step 2: update leader's mapping for the revived task (hold lock)
+	l.mu.Lock()
+	l.taskMapping[arg.TaskID] = rss.TaskIPAndPID{IP: worker, PID: assignReply}
+	// If revived task is in stage 0 (the first stage), do leader-only map fix
 
-    if arg.Stage == 0 {
-        l.mu.Unlock()
-        *reply = true
-        return nil
-    }
+	if arg.Stage == 0 {
+		l.mu.Unlock()
+		*reply = true
+		return nil
+	}
 
-    // Step 3: not first stage → we must notify upstream tasks in previous stage
-    prevStage := arg.Stage - 1
-    start := prevStage * tasksPerStage
-    end := start + tasksPerStage // exclusive upper bound
+	// Step 3: not first stage → we must notify upstream tasks in previous stage
+	prevStage := arg.Stage - 1
+	start := prevStage * tasksPerStage
+	end := start + tasksPerStage // exclusive upper bound
 
-    // collect upstream worker addresses while holding lock
-    upstreamWorkers := make([]string, 0, tasksPerStage)
-    for upstreamID := start; upstreamID < end; upstreamID++ {
-        w, ok := l.taskMapping[upstreamID]
-        if !ok {
-            l.mu.Unlock()
-            return fmt.Errorf("no worker mapping for upstream task %d", upstreamID)
-        }
-        upstreamWorkers = append(upstreamWorkers, w.IP)
-    }
-    l.mu.Unlock()
+	// collect upstream worker addresses while holding lock
+	upstreamWorkers := make([]string, 0, tasksPerStage)
+	for upstreamID := start; upstreamID < end; upstreamID++ {
+		w, ok := l.taskMapping[upstreamID]
+		if !ok {
+			l.mu.Unlock()
+			return fmt.Errorf("no worker mapping for upstream task %d", upstreamID)
+		}
+		upstreamWorkers = append(upstreamWorkers, w.IP)
+	}
+	l.mu.Unlock()
 
-    // Step 4: notify upstream tasks (do RPCs without holding leader lock)
-    // Build downstream info for the revived task
-    downstreamInfo := rss.DownstreamInfo{TaskID: arg.TaskID, IP: worker}
-    for i, upstreamWorker := range upstreamWorkers {
-        upstreamTaskID := start + i
-        var updateReply bool
-        args := &rss.UpdateDownstreamArgs{
-            TaskID:  upstreamTaskID,
-            Downstream: downstreamInfo,
-        }
-        if err := sendRPC(upstreamWorker, "Worker.UpdateDownstream", args, &updateReply); err != nil {
-            return fmt.Errorf("failed to update upstream task %d on %s: %v", upstreamTaskID, upstreamWorker, err)
-        }
-        if !updateReply {
-            return fmt.Errorf("upstream worker %s declined update for task %d", upstreamWorker, upstreamTaskID)
-        }
-    }
+	// Step 4: notify upstream tasks (do RPCs without holding leader lock)
+	// Build downstream info for the revived task
+	downstreamInfo := rss.DownstreamInfo{TaskID: arg.TaskID, IP: worker}
+	for i, upstreamWorker := range upstreamWorkers {
+		upstreamTaskID := start + i
+		var updateReply bool
+		args := &rss.UpdateDownstreamArgs{
+			TaskID:     upstreamTaskID,
+			Downstream: downstreamInfo,
+		}
+		if err := sendRPC(upstreamWorker, "Worker.UpdateDownstream", args, &updateReply); err != nil {
+			return fmt.Errorf("failed to update upstream task %d on %s: %v", upstreamTaskID, upstreamWorker, err)
+		}
+		if !updateReply {
+			return fmt.Errorf("upstream worker %s declined update for task %d", upstreamWorker, upstreamTaskID)
+		}
+	}
 
-    *reply = true
-    return nil
+	*reply = true
+	return nil
 }
 
+// monitorSent periodically resends tuples that the leader has sent but not yet
+// received an ack for from stage-1 tasks. It mirrors worker-side resend logic
+// but uses leader's sentTuples and ackedTuples maps.
+func (l *Leader) monitorSent() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// Copy unacked sent tuples while holding read locks
+		unacked := []rss.Tuple{}
+		keys := []string{}
+
+		l.sentMu.RLock()
+		for k, t := range l.sentTuples {
+			unacked = append(unacked, t)
+			keys = append(keys, k)
+		}
+		l.sentMu.RUnlock()
+
+		for i, tuple := range unacked {
+			key := keys[i]
+
+			// If already acked, skip
+			l.ackedMu.RLock()
+			_, acked := l.ackedTuples[key]
+			l.ackedMu.RUnlock()
+			if acked {
+				continue
+			}
+
+			// Get where to resend (which task/worker)
+			l.sentMu.RLock()
+			tid, ok := l.sentTask[key]
+			l.sentMu.RUnlock()
+			if !ok {
+				continue
+			}
+
+			l.mu.Lock()
+			wp, ok := l.taskMapping[tid]
+			l.mu.Unlock()
+			if !ok {
+				// no mapping available (task might be down), skip for now
+				continue
+			}
+
+			log.Printf("Leader: Tuple %s not acked, resending to task %d at %s", key, tid, wp.IP)
+			var dummy bool
+			args := &rss.AddTuplesArgs{
+				TaskID:     tid,
+				Tuples:     []rss.Tuple{tuple},
+				SourceIP:   getLocalIP() + ":9300",
+				SourceTask: -1,
+			}
+			if err := sendRPC(wp.IP, "Worker.AddTuples", args, &dummy); err != nil {
+				log.Printf("Leader: failed to resend tuple %s to %s: %v", key, wp.IP, err)
+			}
+		}
+	}
+}
 
 // --------------------------
 // Helper methods
 // --------------------------
-
 
 func discoverWorkers() []string {
 	live := []string{}
@@ -363,14 +426,14 @@ func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int, inputR
 	leaderIP := getLocalIP() + ":9300" // Leader's IP with RPC port
 
 	var ticker *time.Ticker
-    if inputRate > 0 {
-        // Calculate the interval between sends (1 second / rate)
-        // e.g., if rate is 100, interval is 10ms
-        interval := time.Duration(int64(time.Second) / int64(inputRate))
-        ticker = time.NewTicker(interval)
-        defer ticker.Stop()
-        fmt.Printf("Source started with Input Rate: %d tuples/sec\n", inputRate)
-    }
+	if inputRate > 0 {
+		// Calculate the interval between sends (1 second / rate)
+		// e.g., if rate is 100, interval is 10ms
+		interval := time.Duration(int64(time.Second) / int64(inputRate))
+		ticker = time.NewTicker(interval)
+		defer ticker.Stop()
+		fmt.Printf("Source started with Input Rate: %d tuples/sec\n", inputRate)
+	}
 
 	scanner := bufio.NewScanner(file)
 	lineNum := 0
@@ -406,6 +469,12 @@ func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int, inputR
 			fmt.Printf("failed to send tuple to worker %s task %d: %v\n", workerAddr, taskID, err)
 			// optionally buffer for retry
 		}
+
+		// Record that leader sent this tuple so we can resend until acked
+		l.sentMu.Lock()
+		l.sentTuples[key] = tuple
+		l.sentTask[key] = taskID
+		l.sentMu.Unlock()
 
 		lineNum++
 	}
@@ -476,12 +545,15 @@ func main() {
 	node = hydfs.Start()
 
 	leader := &Leader{
-		workers:     nil,                       // start empty
-		taskMapping: make(map[int]rss.TaskIPAndPID),      // taskID → worker
-		tupleBuffer: make(map[int][]rss.Tuple), // in-flight tuples
-		ackedTuples: make(map[string]rss.Tuple), // tuples acked by stage 1
+		workers:         nil,                            // start empty
+		taskMapping:     make(map[int]rss.TaskIPAndPID), // taskID → worker
+		tupleBuffer:     make(map[int][]rss.Tuple),      // in-flight tuples
+		ackedTuples:     make(map[string]rss.Tuple),     // tuples acked by stage 1
+		sentTuples:      make(map[string]rss.Tuple),     // tuples sent by leader
+		sentTask:        make(map[string]int),
 		RoundRobinIndex: 0,
 	}
+
 
 	// Register leader RPC
 	rpc.Register(leader)
@@ -555,7 +627,6 @@ func main() {
 			continue
 		}
 
-
 		// Check if it's a hydfs command
 		if hydfs.HydfsResponder(node, line) {
 			continue
@@ -585,12 +656,18 @@ func main() {
 		hydfs.HandleCreate(node, "../emptyfile.txt", cmd.HydfsDest)
 		leader.assignAllTasks(cmd)
 
+		// Configure Exactly-Once behavior and start leader resend monitor if enabled
+		leader.ExactlyOnce = cmd.ExactlyOnce
+		if leader.ExactlyOnce {
+			go leader.monitorSent()
+		}
+
 		go func() {
 			err := leader.ReadFileAndSendTuples(cmd.HydfsSrc, cmd.NtasksPerStage, cmd.InputRate)
 			if err != nil {
 				fmt.Printf("Error in source stream: %v\n", err)
 			}
-	   }()
+		}()
 
 		fmt.Println("Command processed. Enter next command:")
 	}
