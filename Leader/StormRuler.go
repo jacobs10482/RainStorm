@@ -261,7 +261,42 @@ func pingWorker(addr string) bool {
 	callErr := client.Call("Worker.Heartbeat", &struct{}{}, &ok)
 	return callErr == nil && ok
 }
+func (l *Leader) handleListTasks() {
+    l.mu.Lock()
+    currentWorkers := l.workers
+    l.mu.Unlock()
 
+    if len(currentWorkers) == 0 {
+        fmt.Println("No workers connected.")
+        return
+    }
+
+    fmt.Printf("%-10s %-20s %-10s %-15s %-30s\n", "TaskID", "VM IP", "PID", "Exe", "Log File")
+    fmt.Println(strings.Repeat("-", 90))
+
+    for _, workerAddr := range currentWorkers {
+        args := rss.GetTaskStatusArgs{}
+        var reply rss.GetTaskStatusReply
+
+        // Call the worker
+        err := sendRPC(workerAddr, "Worker.GetTaskStatus", &args, &reply)
+        if err != nil {
+            fmt.Printf("Failed to query worker %s: %v\n", workerAddr, err)
+            continue
+        }
+
+        for _, report := range reply.Reports {
+            fmt.Printf("%-10d %-20s %-10d %-15s %-30s\n", 
+                report.TaskID, 
+                workerAddr, 
+                report.PID, 
+                report.Exe, 
+                report.LogFile,
+            )
+        }
+    }
+    fmt.Println(strings.Repeat("-", 90))
+}
 func parseRainStormCommand(line string) (*RainStormCommand, error) {
 	parts := strings.Fields(line)
 	if len(parts) < 7 { // minimal check
@@ -624,6 +659,9 @@ func main() {
 				continue
 			}
 			fmt.Printf("Task %d killed successfully\n", taskID)
+			continue
+		case "list_tasks":
+			leader.handleListTasks()
 			continue
 		}
 

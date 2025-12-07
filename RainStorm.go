@@ -33,6 +33,7 @@ type TupleWithSource struct {
 type TaskState struct {
 	ID                  int
 	Stage               int
+	Exe                 string
 	TaskArgs            rss.AssignTaskArgs
 	HydfsDest           string
 	LastStageOutputFile string
@@ -166,6 +167,7 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *int) error {
 		ID:                  args.TaskID,
 		Stage:               args.Stage,
 		Cmd:                 cmd,
+		Exe:                 args.Exe,
 		HydfsDest:           args.Dest,
 		Stdin:               stdin,
 		Stdout:              stdout,
@@ -212,6 +214,29 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *int) error {
 	*reply = cmd.Process.Pid
 
 	return nil
+}
+func (w *Worker) GetTaskStatus(args *rss.GetTaskStatusArgs, reply *rss.GetTaskStatusReply) error {
+    tasksMu.Lock()
+    defer tasksMu.Unlock()
+
+    var reports []rss.TaskReport
+
+    for _, ts := range tasks {
+        pid := -1
+        if ts.Cmd != nil && ts.Cmd.Process != nil {
+            pid = ts.Cmd.Process.Pid
+        }
+
+        reports = append(reports, rss.TaskReport{
+            TaskID:  ts.ID,
+            PID:     pid,
+            Exe:     ts.Exe,
+            LogFile: ts.ProcessedLogFile,
+        })
+    }
+
+    reply.Reports = reports
+    return nil
 }
 func monitorTaskFailure(ts *TaskState) {
 	// Wait for the command to finish
