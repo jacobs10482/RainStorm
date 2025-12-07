@@ -56,8 +56,9 @@ type TupleOutputArgs struct {
 }
 
 type UpdateDownstreamArgs struct {
-	TaskID     int
-	Downstream DownstreamInfo
+	TaskID          int
+	DownstreamIndex int // index in the Downstream slice to update
+	Downstream      DownstreamInfo
 }
 
 type TaskIPAndPID struct {

@@ -87,6 +87,7 @@ type Leader struct {
 	metricsPerTask  map[int]float64 // taskID -> last reported rate
 	metricsMu       sync.Mutex
 	RoundRobinIndex int
+	nextTaskID      int // counter for generating unique task IDs
 }
 
 // --------------------------
@@ -104,6 +105,19 @@ func (l *Leader) AckTuple(args *rss.TupleOutputArgs, reply *bool) error {
 	return nil
 }
 
+// ReportMetrics receives per-task input rate metrics from workers.
+func (l *Leader) ReportMetrics(args *rss.MetricsArgs, reply *bool) error {
+	l.metricsMu.Lock()
+	defer l.metricsMu.Unlock()
+
+	for _, m := range args.Metrics {
+		l.metricsPerTask[m.TaskID] = m.Rate
+	}
+
+	*reply = true
+	return nil
+}
+
 func sendRPC(addr string, method string, args interface{}, reply interface{}) error {
 	client, err := rpc.Dial("tcp", addr)
 	if err != nil {
@@ -115,9 +129,7 @@ func sendRPC(addr string, method string, args interface{}, reply interface{}) er
 }
 
 // monitorMetrics periodically (every 2s) scans the stored per-task metrics,
-// sums rates per stage and logs decisions. It does not perform scaling yet;
-// it only reports what would be done. This keeps autoscale decision logic
-// observable while we implement actual add/remove later.
+// computes average rate per stage and scales up/down based on HW/LW.
 func (l *Leader) monitorMetrics() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -135,11 +147,15 @@ func (l *Leader) monitorMetrics() {
 		}
 		l.metricsMu.Unlock()
 
-		// For each stage, compute sum over active tasks
+		// For each stage, compute average over active tasks
 		for stage := 0; stage < l.Nstages; stage++ {
 			l.mu.Lock()
 			ids := append([]int(nil), l.activeTasks[stage]...)
 			l.mu.Unlock()
+
+			if len(ids) == 0 {
+				continue
+			}
 
 			sum := 0.0
 			for _, tid := range ids {
@@ -147,17 +163,185 @@ func (l *Leader) monitorMetrics() {
 					sum += r
 				}
 			}
+			avg := sum / float64(len(ids))
 
-			log.Printf("monitorMetrics: stage %d total_rate=%.2f (HW=%d LW=%d)", stage, sum, l.StageHW, l.StageLW)
+			log.Printf("monitorMetrics: stage %d avg_rate=%.2f count=%d (HW=%d LW=%d)", stage, avg, len(ids), l.StageHW, l.StageLW)
 
-			// Placeholder: we do not perform scaling yet — just log potential actions
-			if l.StageHW > 0 && sum > float64(l.StageHW) {
-				log.Printf("monitorMetrics: stage %d would add task (sum %.2f > HW %d)", stage, sum, l.StageHW)
-			} else if l.StageLW > 0 && sum < float64(l.StageLW) {
-				log.Printf("monitorMetrics: stage %d would remove task (sum %.2f < LW %d)", stage, sum, l.StageLW)
+			// Scale up: average rate > HW
+			if l.StageHW > 0 && avg > float64(l.StageHW) {
+				log.Printf("monitorMetrics: stage %d adding task (avg %.2f > HW %d)", stage, avg, l.StageHW)
+				if err := l.addTaskToStage(stage); err != nil {
+					log.Printf("monitorMetrics: failed to add task to stage %d: %v", stage, err)
+				}
+			} else if l.StageLW > 0 && avg < float64(l.StageLW) && len(ids) > 1 {
+				// Scale down: average rate < LW, but keep at least 1 task
+				log.Printf("monitorMetrics: stage %d removing task (avg %.2f < LW %d)", stage, avg, l.StageLW)
+				if err := l.removeTaskFromStage(stage); err != nil {
+					log.Printf("monitorMetrics: failed to remove task from stage %d: %v", stage, err)
+				}
 			}
 		}
 	}
+}
+
+// addTaskToStage creates a new task for the given stage, assigns it to a worker,
+// and updates upstream tasks with the new downstream.
+func (l *Leader) addTaskToStage(stage int) error {
+	l.mu.Lock()
+	if len(l.workers) == 0 {
+		l.mu.Unlock()
+		return fmt.Errorf("no workers available")
+	}
+
+	// Generate new task ID
+	newTaskID := l.nextTaskID
+	l.nextTaskID++
+
+	// Pick worker via round-robin
+	worker := l.workers[l.RoundRobinIndex%len(l.workers)]
+	l.RoundRobinIndex++
+
+	// Build downstream list (if not final stage)
+	var downstream []rss.DownstreamInfo
+	if stage < l.Nstages-1 {
+		nextStageIDs := l.activeTasks[stage+1]
+		for _, dtid := range nextStageIDs {
+			if wp, ok := l.taskMapping[dtid]; ok {
+				downstream = append(downstream, rss.DownstreamInfo{IP: wp.IP, TaskID: dtid})
+			}
+		}
+	}
+
+	// Get stage operator info
+	op := l.Ops[stage]
+	l.mu.Unlock()
+
+	// Build AssignTask args
+	args := &rss.AssignTaskArgs{
+		TaskID:            newTaskID,
+		Stage:             stage,
+		Dest:              "", // will be set from existing tasks or command
+		Exe:               op.Exe,
+		Args:              op.Args,
+		LeaderIP:          getLocalIP() + ":9300",
+		Downstream:        downstream,
+		Exactly_Once:      l.ExactlyOnce,
+		Autoscale_Enabled: l.Autoscale,
+		LW:                l.StageLW,
+		HW:                l.StageHW,
+	}
+
+	// Assign task on worker
+	var reply int
+	if err := sendRPC(worker, "Worker.AssignTask", args, &reply); err != nil {
+		return fmt.Errorf("failed to assign task %d to %s: %v", newTaskID, worker, err)
+	}
+
+	// Update leader state
+	l.mu.Lock()
+	l.taskMapping[newTaskID] = rss.TaskIPAndPID{IP: worker, PID: reply}
+	l.activeTasks[stage] = append(l.activeTasks[stage], newTaskID)
+	l.mu.Unlock()
+
+	// Update upstream tasks with new downstream
+	if stage > 0 {
+		if err := l.updateUpstreamDownstreams(stage); err != nil {
+			log.Printf("addTaskToStage: failed to update upstream for stage %d: %v", stage, err)
+		}
+	}
+
+	log.Printf("addTaskToStage: added task %d to stage %d on worker %s", newTaskID, stage, worker)
+	return nil
+}
+
+// removeTaskFromStage removes one task from the given stage, kills it,
+// and updates upstream tasks with the new downstream list.
+func (l *Leader) removeTaskFromStage(stage int) error {
+	l.mu.Lock()
+	ids := l.activeTasks[stage]
+	if len(ids) <= 1 {
+		l.mu.Unlock()
+		return fmt.Errorf("cannot remove task: only %d tasks in stage %d", len(ids), stage)
+	}
+
+	// Remove last task in the list
+	taskToRemove := ids[len(ids)-1]
+	l.activeTasks[stage] = ids[:len(ids)-1]
+
+	wp, ok := l.taskMapping[taskToRemove]
+	if !ok {
+		l.mu.Unlock()
+		return fmt.Errorf("task %d not found in taskMapping", taskToRemove)
+	}
+	delete(l.taskMapping, taskToRemove)
+	l.mu.Unlock()
+
+	// Remove from metrics
+	l.metricsMu.Lock()
+	delete(l.metricsPerTask, taskToRemove)
+	l.metricsMu.Unlock()
+
+	// Kill the task on the worker
+	var reply bool
+	if err := sendRPC(wp.IP, "Worker.KillTask", &rss.KillTaskArgs{TaskID: taskToRemove}, &reply); err != nil {
+		log.Printf("removeTaskFromStage: failed to kill task %d: %v", taskToRemove, err)
+	}
+
+	// Update upstream tasks with new downstream list (without the removed task)
+	if stage > 0 {
+		if err := l.updateUpstreamDownstreams(stage); err != nil {
+			log.Printf("removeTaskFromStage: failed to update upstream for stage %d: %v", stage, err)
+		}
+	}
+
+	log.Printf("removeTaskFromStage: removed task %d from stage %d", taskToRemove, stage)
+	return nil
+}
+
+// updateUpstreamDownstreams rebuilds the downstream list for all tasks in stage-1
+// based on the current activeTasks[stage] and sends updates to workers.
+func (l *Leader) updateUpstreamDownstreams(stage int) error {
+	if stage == 0 {
+		return nil // stage 0 has no upstream tasks (only leader)
+	}
+
+	l.mu.Lock()
+	upstreamIDs := append([]int(nil), l.activeTasks[stage-1]...)
+	downstreamIDs := append([]int(nil), l.activeTasks[stage]...)
+
+	// Build new downstream list
+	var newDownstream []rss.DownstreamInfo
+	for _, dtid := range downstreamIDs {
+		if wp, ok := l.taskMapping[dtid]; ok {
+			newDownstream = append(newDownstream, rss.DownstreamInfo{IP: wp.IP, TaskID: dtid})
+		}
+	}
+
+	// Collect upstream worker info
+	upstreamWorkers := make(map[int]string) // taskID -> worker IP
+	for _, tid := range upstreamIDs {
+		if wp, ok := l.taskMapping[tid]; ok {
+			upstreamWorkers[tid] = wp.IP
+		}
+	}
+	l.mu.Unlock()
+
+	// Send update to each upstream task
+	for tid, workerIP := range upstreamWorkers {
+		for i, ds := range newDownstream {
+			args := &rss.UpdateDownstreamArgs{
+				TaskID:          tid,
+				DownstreamIndex: i,
+				Downstream:      ds,
+			}
+			var reply bool
+			if err := sendRPC(workerIP, "Worker.UpdateDownstream", args, &reply); err != nil {
+				log.Printf("updateUpstreamDownstreams: failed to update task %d downstream[%d]: %v", tid, i, err)
+			}
+		}
+	}
+
+	return nil
 }
 
 func (l *Leader) TaskFailed(args *rss.ReviveTaskArgs, reply *bool) error {
@@ -192,36 +376,50 @@ func (l *Leader) TaskFailed(args *rss.ReviveTaskArgs, reply *bool) error {
 
 	// Step 3: not first stage → we must notify upstream tasks in previous stage
 	prevStage := arg.Stage - 1
-	start := prevStage * tasksPerStage
-	end := start + tasksPerStage // exclusive upper bound
+	upstreamIDs := append([]int(nil), l.activeTasks[prevStage]...)
+
+	// Find which index in downstream the revived task should occupy
+	currentStageIDs := l.activeTasks[arg.Stage]
+	downstreamIndex := -1
+	for i, tid := range currentStageIDs {
+		if tid == arg.TaskID {
+			downstreamIndex = i
+			break
+		}
+	}
+	if downstreamIndex == -1 {
+		// Task not in activeTasks yet for this stage, add it
+		l.activeTasks[arg.Stage] = append(l.activeTasks[arg.Stage], arg.TaskID)
+		downstreamIndex = len(l.activeTasks[arg.Stage]) - 1
+	}
 
 	// collect upstream worker addresses while holding lock
-	upstreamWorkers := make([]string, 0, tasksPerStage)
-	for upstreamID := start; upstreamID < end; upstreamID++ {
+	upstreamWorkers := make(map[int]string) // taskID -> worker IP
+	for _, upstreamID := range upstreamIDs {
 		w, ok := l.taskMapping[upstreamID]
 		if !ok {
 			l.mu.Unlock()
 			return fmt.Errorf("no worker mapping for upstream task %d", upstreamID)
 		}
-		upstreamWorkers = append(upstreamWorkers, w.IP)
+		upstreamWorkers[upstreamID] = w.IP
 	}
 	l.mu.Unlock()
 
 	// Step 4: notify upstream tasks (do RPCs without holding leader lock)
 	// Build downstream info for the revived task
 	downstreamInfo := rss.DownstreamInfo{TaskID: arg.TaskID, IP: worker}
-	for i, upstreamWorker := range upstreamWorkers {
-		upstreamTaskID := start + i
+	for upstreamTaskID, upstreamWorkerIP := range upstreamWorkers {
 		var updateReply bool
 		args2 := &rss.UpdateDownstreamArgs{
-			TaskID:     upstreamTaskID,
-			Downstream: downstreamInfo,
+			TaskID:          upstreamTaskID,
+			DownstreamIndex: downstreamIndex,
+			Downstream:      downstreamInfo,
 		}
-		if err := sendRPC(upstreamWorker, "Worker.UpdateDownstream", args2, &updateReply); err != nil {
-			return fmt.Errorf("failed to update upstream task %d on %s: %v", upstreamTaskID, upstreamWorker, err)
+		if err := sendRPC(upstreamWorkerIP, "Worker.UpdateDownstream", args2, &updateReply); err != nil {
+			return fmt.Errorf("failed to update upstream task %d on %s: %v", upstreamTaskID, upstreamWorkerIP, err)
 		}
 		if !updateReply {
-			return fmt.Errorf("upstream worker %s declined update for task %d", upstreamWorker, upstreamTaskID)
+			return fmt.Errorf("upstream worker %s declined update for task %d", upstreamWorkerIP, upstreamTaskID)
 		}
 	}
 
@@ -501,6 +699,14 @@ func (l *Leader) assignAllTasks(cmd *RainStormCommand) error {
 
 			// Save mapping
 			l.taskMapping[tid] = rss.TaskIPAndPID{IP: worker, PID: reply}
+
+			// Track active tasks per stage
+			l.activeTasks[stage] = append(l.activeTasks[stage], tid)
+
+			// Update nextTaskID to be beyond all assigned IDs
+			if tid >= l.nextTaskID {
+				l.nextTaskID = tid + 1
+			}
 		}
 	}
 
@@ -643,6 +849,9 @@ func main() {
 		sentTuples:      make(map[string]rss.Tuple),     // tuples sent by leader
 		sentTask:        make(map[string]int),
 		RoundRobinIndex: 0,
+		activeTasks:     make(map[int][]int),
+		metricsPerTask:  make(map[int]float64),
+		nextTaskID:      0,
 	}
 
 	// Register leader RPC
@@ -755,8 +964,12 @@ func main() {
 			go leader.monitorSent()
 		}
 
-		// Configure Autoscale behavior and start metrics monitor if enabled
+		// Configure Autoscale behavior and store parameters
 		leader.Autoscale = cmd.Autoscale
+		leader.Nstages = cmd.Nstages
+		leader.StageHW = cmd.HW
+		leader.StageLW = cmd.LW
+		leader.Ops = cmd.Ops
 		if leader.Autoscale {
 			go leader.monitorMetrics()
 		}

@@ -343,7 +343,12 @@ func (w *Worker) UpdateDownstream(args *rss.UpdateDownstreamArgs, reply *bool) e
 		return fmt.Errorf("task %d not found", args.TaskID)
 	}
 
-	ts.Downstream[args.TaskID] = args.Downstream
+	idx := args.DownstreamIndex
+	// Expand slice if needed
+	for len(ts.Downstream) <= idx {
+		ts.Downstream = append(ts.Downstream, rss.DownstreamInfo{})
+	}
+	ts.Downstream[idx] = args.Downstream
 	*reply = true
 	return nil
 }
