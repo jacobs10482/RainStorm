@@ -141,6 +141,8 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *int) error {
 		argList = strings.Fields(args.Args)
 	}
 
+	
+
 	cmd := exec.Command(args.Exe, argList...)
 
 	stdin, err := cmd.StdinPipe()

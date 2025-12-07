@@ -585,6 +585,7 @@ func parseRainStormCommand(line string) (*RainStormCommand, error) {
 			Exe:  exe,
 			Args: arg,
 		}
+		fmt.Printf("Args: %s\n", arg)
 	}
 
 	offset := 3 + 2*nStages
