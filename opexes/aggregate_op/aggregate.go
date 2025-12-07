@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/csv"
 	"fmt"
 	"os"
 	"strings"
@@ -37,7 +38,14 @@ func main() {
 		}
 
 		value := parts[1]           // full original dataset line
-		cols := strings.Split(value, ",") 
+		r := csv.NewReader(strings.NewReader(value))
+		r.FieldsPerRecord = -1 // allow variable column count
+
+		cols, err := r.Read()
+		if err != nil {
+			// Malformed CSV → skip
+			continue
+		}
 
 		var key string
 		if len(cols) < N {
