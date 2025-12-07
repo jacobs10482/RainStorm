@@ -481,7 +481,7 @@ func (w *Worker) AddTuples(args *rss.AddTuplesArgs, reply *bool) error {
 	return nil
 }
 
-/*
+
 func (w *Worker) KillTask(args *rss.KillTaskArgs, reply *bool) error {
 	tasksMu.Lock()
 	ts, ok := tasks[args.TaskID]
@@ -504,7 +504,8 @@ func (w *Worker) KillTask(args *rss.KillTaskArgs, reply *bool) error {
 	*reply = true
 	return nil
 }
-*/
+
+
 func getLocalIP() string {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
