@@ -251,11 +251,11 @@ func parseRainStormCommand(line string) (*RainStormCommand, error) {
 	}
 
 	inputRate, lw, hw := 0, 0, 0
+	inputRate, err = strconv.Atoi(parts[offset+4])
+	if err != nil {
+		return nil, fmt.Errorf("invalid INPUT_RATE: %v", err)
+	}
 	if autoscale {
-		inputRate, err = strconv.Atoi(parts[offset+4])
-		if err != nil {
-			return nil, fmt.Errorf("invalid INPUT_RATE: %v", err)
-		}
 		lw, err = strconv.Atoi(parts[offset+5])
 		if err != nil {
 			return nil, fmt.Errorf("invalid LW: %v", err)
