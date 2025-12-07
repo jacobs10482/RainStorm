@@ -364,7 +364,8 @@ func monitorAcks(ts *TaskState) {
 		}
 	}
 }
-//working state
+
+// working state
 func (w *Worker) UpdateDownstream(args *rss.UpdateDownstreamArgs, reply *bool) error {
 	tasksMu.Lock()
 	defer tasksMu.Unlock()
@@ -451,29 +452,33 @@ func processTuples(ts *TaskState) {
 		// Check for __DROP__ BEFORE storing in ProcessedTuples
 		// This prevents monitorAcks from resending dropped tuples to downstream
 		if outputTuple.Value == "__DROP__" {
-			// Mark as processed but don't store for resend (ack immediately)
+			if ts.TaskArgs.Exactly_Once {
+				// Mark as processed
+				ts.mu1.Lock()
+				ts.ProcessedTuples[tuple.TupleID] = outputTuple
+				ts.mu1.Unlock()
+
+				// Mark as acked immediately so monitorAcks doesn't resend
+				ts.mu2.Lock()
+				ts.AckedTuples[tuple.TupleID] = outputTuple
+				ts.mu2.Unlock()
+
+				// Just ack back to the source (filtered out), don't forward
+				sendAck(tupleWithSource.SourceIP, tupleWithSource.SourceTask, tuple)
+			}
+			continue
+		}
+
+		// Store and log for recovery (only if exactly_once is enabled)
+		if ts.TaskArgs.Exactly_Once {
 			ts.mu1.Lock()
 			ts.ProcessedTuples[tuple.TupleID] = outputTuple
 			ts.mu1.Unlock()
 
-			// Mark as acked immediately so monitorAcks doesn't resend
-			ts.mu2.Lock()
-			ts.AckedTuples[tuple.TupleID] = outputTuple
-			ts.mu2.Unlock()
-
-			// Just ack back to the source (filtered out), don't forward
-			sendAck(tupleWithSource.SourceIP, tupleWithSource.SourceTask, tuple)
-			continue
+			// Write to log: TupleID\tKey\tValue (for recovery)
+			line := fmt.Sprintf("%s\t%s\t%s\n", tuple.TupleID, outputTuple.Key, outputTuple.Value)
+			hydfs.HandleAppendString(node, line, ts.ProcessedLogFile)
 		}
-
-		// Store OUTPUT tuple keyed by TupleID for resend if not acked
-		ts.mu1.Lock()
-		ts.ProcessedTuples[tuple.TupleID] = outputTuple
-		ts.mu1.Unlock()
-
-		// Write to log: TupleID\tKey\tValue (for recovery)
-		line := fmt.Sprintf("%s\t%s\t%s\n", tuple.TupleID, outputTuple.Key, outputTuple.Value)
-		hydfs.HandleAppendString(node, line, ts.ProcessedLogFile)
 
 		// Handle final stage vs intermediate stage
 		if len(ts.Downstream) == 0 {
@@ -486,43 +491,39 @@ func processTuples(ts *TaskState) {
 			hydfs.HandleAppend(node, ts.LastStageOutputFile, ts.HydfsDest)
 			os.WriteFile(ts.LastStageOutputFile, []byte{}, 0644)
 
-			// Send ack back to source
-			sendAck(tupleWithSource.SourceIP, tupleWithSource.SourceTask, tuple)
+			// Send ack back to source (only if exactly_once is enabled)
+			if ts.TaskArgs.Exactly_Once {
+				sendAck(tupleWithSource.SourceIP, tupleWithSource.SourceTask, tuple)
+			}
 		} else {
 			// Intermediate stage - forward to downstream
 			idx := int(HashKey(outputTuple.Key)) % len(ts.Downstream)
 			target := ts.Downstream[idx]
 
-			// Forward with retry logic
-			for {
+			// Forward with retry logic (limited retries with backoff)
+			maxRetries := 10
+			for attempt := 0; attempt < maxRetries; attempt++ {
 				var dummyReply bool
 				err := sendRPC(target.IP, "Worker.AddTuples",
 					&rss.AddTuplesArgs{
 						TaskID:     target.TaskID,
 						Tuples:     []rss.Tuple{outputTuple},
-						SourceIP:   getLocalIP() + ":9300", // Worker's IP with port for ack
+						SourceIP:   getLocalIP() + ":9300",
 						SourceTask: ts.ID,
 					},
 					&dummyReply,
 				)
 
 				if err == nil {
-					// Successfully forwarded, now send ack back to our source
-					// If the operator produced a drop marker, don't forward (ack only)
-					if outputTuple.Value == "__DROP__" {
+					// Successfully forwarded, send ack (only if exactly_once is enabled)
+					if ts.TaskArgs.Exactly_Once {
 						sendAck(tupleWithSource.SourceIP, tupleWithSource.SourceTask, tuple)
-						break
 					}
-					// Successfully forwarded, now send ack back to our source
-					sendAck(tupleWithSource.SourceIP, tupleWithSource.SourceTask, tuple)
 					break
 				}
 
-				// RPC failed - in production, notify leader and wait for reassignment
-				log.Printf("Failed to forward tuple to %s, retrying...", target.IP)
-				// For now, just retry (you'll need proper failure handling)
-				// notifyLeaderTaskFailed(target.TaskID)
-				// Wait for leader to update downstream info
+				log.Printf("Failed to forward tuple to %s (attempt %d/%d), retrying...", target.IP, attempt+1, maxRetries)
+				time.Sleep(100 * time.Millisecond) // backoff
 			}
 		}
 	}
