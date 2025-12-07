@@ -359,7 +359,7 @@ func processTuples(ts *TaskState) {
 	scanner := bufio.NewScanner(ts.Stdout)
 
 	for tupleWithSource := range ts.InputQueue {
-
+		fmt.Printf("Task %d processing tuple: %s\n", ts.ID, tupleWithSource.Tuple.Key)
 		select {
 		case err := <-ts.FailureChan:
 			// Something was sent: exit the goroutine
