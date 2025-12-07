@@ -191,7 +191,7 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *int) error {
 	}
 
 	tasks[args.TaskID] = ts
-	fmt.Printf("Assigned task: %s\n, Args: %s", args.Exe, args.Args)
+	fmt.Printf("Assigned task: %s, Args: %s\n", args.Exe, args.Args)
 
 	// Start goroutine to process tuples
 	go processTuples(ts)
@@ -383,6 +383,7 @@ func processTuples(ts *TaskState) {
 		}
 		ts.mu1.RUnlock()
 
+		fmt.Printf("Input Tuple: %s, Value: %s\n", tuple.Key, tuple.Value)
 		// Write tuple to operator's stdin
 		_, err := fmt.Fprintf(ts.Stdin, "%s\t%s\n", tuple.Key, tuple.Value)
 		if err != nil {
