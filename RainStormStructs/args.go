@@ -66,3 +66,20 @@ type TaskIPAndPID struct {
     IP  string
     PID int
 }
+
+// In RainStormStructs package
+
+type TaskReport struct {
+    TaskID   int
+    PID      int
+    Exe      string
+    LogFile  string
+}
+
+type GetTaskStatusArgs struct {
+    // Empty, we just want everything
+}
+
+type GetTaskStatusReply struct {
+    Reports []TaskReport
+}

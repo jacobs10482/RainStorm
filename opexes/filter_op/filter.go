@@ -20,11 +20,21 @@ func main() {
 	for scanner.Scan() {
 		line := scanner.Text()
 
+		// Expect input as: key<TAB>value
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			// Malformed input → skip
+			continue
+		}
+
+		key := parts[0]
+		value := parts[1]
+
 		// Case-sensitive match
-		if strings.Contains(line, pattern) {
+		if strings.Contains(value, pattern) {
 			// Output as: key<TAB>value
 			// Both key and value = full original line
-			fmt.Printf("%s\t%s\n", line, line)
+			fmt.Printf("%s\t%s\n", key, value)
 		}
 	}
 
