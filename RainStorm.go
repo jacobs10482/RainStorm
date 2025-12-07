@@ -139,9 +139,36 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 	// Start goroutine to process tuples
 	go processTuples(ts)
 	go monitorAcks(ts)
+	go monitorTaskFailure(ts)
 
 	*reply = true
 	return nil
+}
+func monitorTaskFailure(ts *TaskState) {
+    // Wait for the command to finish
+    err := ts.Cmd.Wait()
+
+    if err != nil {
+        log.Printf("task %d process exited with error: %v\n", ts.ID, err)
+    } else {
+        log.Printf("task %d process exited normally\n", ts.ID)
+    }
+
+    // Remove task from local map (if not already removed by KillTask)
+    tasksMu.Lock()
+    delete(tasks, ts.ID)
+    tasksMu.Unlock()
+
+
+    var reply bool
+    args := &rss.KillTaskArgs{ TaskID: ts.ID }
+    // call leader's TaskFailed RPC
+    if rpcErr := sendRPC("172.22.95.98:9300", "Leader.TaskFailed", args, &reply); rpcErr != nil {
+        log.Printf("Failed to notify leader about task %d: %v\n", ts.ID, rpcErr)
+    } else {
+        log.Printf("Notified leader that task %d failed\n", ts.ID)
+    }
+    
 }
 
 func monitorAcks(ts *TaskState) {
@@ -200,6 +227,21 @@ func monitorAcks(ts *TaskState) {
         }
     }
 }
+
+func (w *Worker) UpdateDownstream(args *rss.UpdateDownstreamArgs, reply *bool) error {
+    tasksMu.Lock()
+    defer tasksMu.Unlock()
+
+    ts, ok := tasks[args.TaskID]
+    if !ok {
+        return fmt.Errorf("task %d not found", args.TaskID)
+    }
+
+    ts.Downstream = args.Downstream
+    *reply = true
+    return nil
+}
+
 
 // Main processing goroutine - reads from queue, processes, acks, and forwards
 func processTuples(ts *TaskState) {

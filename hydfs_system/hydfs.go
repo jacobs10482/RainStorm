@@ -708,7 +708,7 @@ func HandleAppendString(node *fd.Node, data string, hydfsFile string) {
 }
 
 // handleGet fetches a file from the primary replica and saves it to a local file
-func handleGet(node *fd.Node, hydfsFile, localFile string) {
+func HandleGet(node *fd.Node, hydfsFile, localFile string) {
 	// Determine the primary replica for this file
 	replicas := getReplicas(node, hydfsFile, 3)
 	if len(replicas) == 0 {
@@ -1102,7 +1102,7 @@ func StdinListener(node *fd.Node) {
 			localFile := args[2]
 
 			fmt.Printf("[get] %s -> %s\n", hydfsFile, localFile)
-			handleGet(node, hydfsFile, localFile)
+			HandleGet(node, hydfsFile, localFile)
 
 		case "append":
 			if len(args) != 3 {
@@ -1272,7 +1272,7 @@ func HydfsResponder(node *fd.Node, line string) bool {
 		hydfsFile := args[1]
 		localFile := args[2]
 		fmt.Printf("[get] %s -> %s\n", hydfsFile, localFile)
-		handleGet(node, hydfsFile, localFile)
+		HandleGet(node, hydfsFile, localFile)
 		return true
 
 	case "append":

@@ -52,3 +52,7 @@ type TupleOutputArgs struct {
     Tuple  Tuple
 }
 
+type UpdateDownstreamArgs struct {
+    TaskID     int
+    Downstream []DownstreamInfo
+}
