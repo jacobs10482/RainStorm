@@ -33,6 +33,7 @@ type TupleWithSource struct {
 type TaskState struct {
 	ID                  int
 	Stage               int
+	TaskArgs 		 rss.AssignTaskArgs
 	HydfsDest           string
 	LastStageOutputFile string
 	Cmd                 *exec.Cmd
@@ -175,6 +176,7 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *bool) error {
 		ProcessedLogFile:    processedLog,
     	AckedLogFile:        ackedLog,
 		FailureChan:         make(chan error, 1),
+		TaskArgs:            *args,
 	}
 	if len(recoveredProcessed) == 0 {
         hydfs.HandleCreate(node, "../emptyfile.txt", ts.ProcessedLogFile)
@@ -212,7 +214,7 @@ func monitorTaskFailure(ts *TaskState) {
 
 
     var reply bool
-    args := &rss.KillTaskArgs{ TaskID: ts.ID }
+    args := &rss.ReviveTaskArgs{ Args: &ts.TaskArgs }
     // call leader's TaskFailed RPC
     if rpcErr := sendRPC("172.22.95.98:9300", "Leader.TaskFailed", args, &reply); rpcErr != nil {
         log.Printf("Failed to notify leader about task %d: %v\n", ts.ID, rpcErr)
@@ -298,7 +300,7 @@ func (w *Worker) UpdateDownstream(args *rss.UpdateDownstreamArgs, reply *bool) e
         return fmt.Errorf("task %d not found", args.TaskID)
     }
 
-    ts.Downstream = args.Downstream
+    ts.Downstream[args.TaskID] = args.Downstream
     *reply = true
     return nil
 }
@@ -478,6 +480,7 @@ func (w *Worker) AddTuples(args *rss.AddTuplesArgs, reply *bool) error {
 	return nil
 }
 
+/*
 func (w *Worker) KillTask(args *rss.KillTaskArgs, reply *bool) error {
 	tasksMu.Lock()
 	ts, ok := tasks[args.TaskID]
@@ -500,7 +503,7 @@ func (w *Worker) KillTask(args *rss.KillTaskArgs, reply *bool) error {
 	*reply = true
 	return nil
 }
-
+*/
 func getLocalIP() string {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {

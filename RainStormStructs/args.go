@@ -42,8 +42,12 @@ type AddTuplesArgs struct {
     SourceTask int
 }
 
+type ReviveTaskArgs struct {
+    Args    *AssignTaskArgs
+}
+
 type KillTaskArgs struct {
-    TaskID int
+    TaskID    int
 }
 
 type TupleOutputArgs struct {
@@ -54,5 +58,5 @@ type TupleOutputArgs struct {
 
 type UpdateDownstreamArgs struct {
     TaskID     int
-    Downstream []DownstreamInfo
+    Downstream DownstreamInfo
 }

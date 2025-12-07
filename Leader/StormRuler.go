@@ -30,6 +30,8 @@ var vmMapRPC = map[string]string{
 	"vm10": "172.22.95.101:9300",
 }
 
+var tasksPerStage int = 0
+
 type RainStormCommand struct {
 	Nstages         int
 	NtasksPerStage  int
@@ -70,6 +72,7 @@ type Leader struct {
 	tupleBuffer     map[int][]rss.Tuple
 	ackedTuples     map[string]rss.Tuple  // Track acked tuples from stage 1
 	ackedMu         sync.RWMutex
+	RoundRobinIndex int
 }
 
 // --------------------------
@@ -97,79 +100,80 @@ func sendRPC(addr string, method string, args interface{}, reply interface{}) er
 	return client.Call(method, args, reply)
 }
 
-func (l *Leader) TaskFailed(args *rss.KillTaskArgs, reply *bool) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+func (l *Leader) TaskFailed(args *rss.ReviveTaskArgs, reply *bool) error {
+    l.mu.Lock()
+    arg := args.Args
 
-	workerAddr, ok := l.taskMapping[args.TaskID]
-	if !ok {
-		return fmt.Errorf("task %d not found in mapping", args.TaskID)
-	}
+    // pick worker (round-robin)
+    worker := l.workers[l.RoundRobinIndex]
+    // advance round-robin for next time
+    l.RoundRobinIndex = (l.RoundRobinIndex + 1) % len(l.workers)
+    l.mu.Unlock()
 
-	fmt.Printf("Task %d failed on worker %s, reassigning...\n", args.TaskID, workerAddr)
+    // Step 1: assign task on chosen worker (do network I/O WITHOUT holding leader lock)
+    var assignReply bool
+    if err := sendRPC(worker, "Worker.AssignTask", arg, &assignReply); err != nil {
+        return fmt.Errorf("assigning task %d to %s failed: %v", arg.TaskID, worker, err)
+    }
+    if !assignReply {
+        return fmt.Errorf("worker %s rejected revive for task %d", worker, arg.TaskID)
+    }
 
-	// Save tuples for reassigning (in real implementation you may track in-flight tuples)
-	tuples := l.tupleBuffer[args.TaskID]
+    // Step 2: update leader's mapping for the revived task (hold lock)
+    l.mu.Lock()
+    l.taskMapping[arg.TaskID] = worker
+    // If revived task is in stage 0 (the first stage), do leader-only map fix
 
-	// Remove old mapping
-	delete(l.taskMapping, args.TaskID)
-	delete(l.tupleBuffer, args.TaskID)
+    if arg.Stage == 0 {
+        l.mu.Unlock()
+        *reply = true
+        return nil
+    }
 
-	// Reassign task to a new worker (simplest: first alive worker)
-	for _, addr := range l.workers {
-		fmt.Printf("Reassigning task %d to worker %s\n", args.TaskID, addr)
-		go l.sendTask(addr, args.TaskID, tuples)
-		break
-	}
+    // Step 3: not first stage → we must notify upstream tasks in previous stage
+    prevStage := arg.Stage - 1
+    start := prevStage * tasksPerStage
+    end := start + tasksPerStage // exclusive upper bound
 
-	*reply = true
-	return nil
+    // collect upstream worker addresses while holding lock
+    upstreamWorkers := make([]string, 0, tasksPerStage)
+    for upstreamID := start; upstreamID < end; upstreamID++ {
+        w, ok := l.taskMapping[upstreamID]
+        if !ok {
+            l.mu.Unlock()
+            return fmt.Errorf("no worker mapping for upstream task %d", upstreamID)
+        }
+        upstreamWorkers = append(upstreamWorkers, w)
+    }
+    l.mu.Unlock()
+
+    // Step 4: notify upstream tasks (do RPCs without holding leader lock)
+    // Build downstream info for the revived task
+    downstreamInfo := rss.DownstreamInfo{TaskID: arg.TaskID, IP: worker}
+    for i, upstreamWorker := range upstreamWorkers {
+        upstreamTaskID := start + i
+        var updateReply bool
+        args := &rss.UpdateDownstreamArgs{
+            TaskID:  upstreamTaskID,
+            Downstream: downstreamInfo,
+        }
+        if err := sendRPC(upstreamWorker, "Worker.UpdateDownstream", args, &updateReply); err != nil {
+            return fmt.Errorf("failed to update upstream task %d on %s: %v", upstreamTaskID, upstreamWorker, err)
+        }
+        if !updateReply {
+            return fmt.Errorf("upstream worker %s declined update for task %d", upstreamWorker, upstreamTaskID)
+        }
+    }
+
+    *reply = true
+    return nil
 }
+
 
 // --------------------------
 // Helper methods
 // --------------------------
 
-// Assign a task to a worker
-func (l *Leader) sendTask(workerAddr string, taskID int, tuples []rss.Tuple) {
-	client, err := rpc.Dial("tcp", workerAddr)
-	if err != nil {
-		fmt.Printf("Failed to connect to worker %s: %v\n", workerAddr, err)
-		return
-	}
-	defer client.Close()
-
-	args := AssignTaskArgs{
-		TaskID: taskID,
-		Stage:  0,       // adjust stage as needed
-		Exe:    "./op1", // example, replace with real exe
-		Args:   []string{"pattern"},
-	}
-
-	var reply bool
-	if err := client.Call("Worker.AssignTask", &args, &reply); err != nil {
-		fmt.Printf("Failed to assign task %d to worker %s: %v\n", taskID, workerAddr, err)
-		return
-	}
-
-	if len(tuples) > 0 {
-		addArgs := rss.AddTuplesArgs{
-			TaskID:     taskID,
-			Tuples:     tuples,
-			SourceIP:   getLocalIP() + ":9300", // Leader's IP with RPC port
-			SourceTask: -1,                      // -1 indicates leader/source
-		}
-		if err := client.Call("Worker.AddTuples", &addArgs, &reply); err != nil {
-			fmt.Printf("Failed to send tuples to task %d on worker %s: %v\n", taskID, workerAddr, err)
-		}
-	}
-
-	// Save mapping
-	l.mu.Lock()
-	l.taskMapping[taskID] = workerAddr
-	l.tupleBuffer[taskID] = tuples
-	l.mu.Unlock()
-}
 
 func discoverWorkers() []string {
 	live := []string{}
@@ -296,6 +300,7 @@ func (l *Leader) assignAllTasks(cmd *RainStormCommand) error {
 			tid := taskID(stage, i, tps)
 			worker := workers[tid%wcount] // round-robin
 			taskToWorker[tid] = worker
+			l.RoundRobinIndex = (l.RoundRobinIndex + 1) % wcount
 		}
 	}
 
@@ -460,6 +465,7 @@ func main() {
 		taskMapping: make(map[int]string),      // taskID → worker
 		tupleBuffer: make(map[int][]rss.Tuple), // in-flight tuples
 		ackedTuples: make(map[string]rss.Tuple), // tuples acked by stage 1
+		RoundRobinIndex: 0,
 	}
 
 	// Register leader RPC
@@ -521,6 +527,7 @@ func main() {
 
 		fmt.Printf("Parsed command: %+v\n", cmd)
 
+		tasksPerStage = cmd.NtasksPerStage
 		// Ensure workers are discovered before assigning tasks
 		if len(leader.workers) == 0 {
 			fmt.Println("No workers discovered. Please run `discover` first.")
