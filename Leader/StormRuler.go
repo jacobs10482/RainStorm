@@ -870,43 +870,52 @@ func (l *Leader) ReadFileAndSendTuples(filename string, nTasksStage1 int, inputR
 		// Choose stage-1 task from the current live list instead of relying
 		// on a static numbering. This ensures autoscale (add/remove tasks)
 		// doesn't cause the leader to send keys to the wrong task.
-		l.mu.Lock()
-		stage1IDs := append([]int(nil), l.activeTasks[0]...)
-		l.mu.Unlock()
+		// Retry loop: on failure, refresh the active task list and try again
+		maxRetries := 5
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			l.mu.Lock()
+			stage1IDs := append([]int(nil), l.activeTasks[0]...)
+			l.mu.Unlock()
 
-		if len(stage1IDs) == 0 {
-			return fmt.Errorf("no active tasks in stage 0 to send tuples to")
+			if len(stage1IDs) == 0 {
+				return fmt.Errorf("no active tasks in stage 0 to send tuples to")
+			}
+
+			idx := int(rss.HashKey(tuple.Key)) % len(stage1IDs)
+			taskID := stage1IDs[idx]
+
+			l.mu.Lock()
+			wp, ok := l.taskMapping[taskID]
+			l.mu.Unlock()
+			if !ok {
+				// Task was removed, retry with fresh list
+				log.Printf("Task %d not in taskMapping, retrying with fresh list (attempt %d)", taskID, attempt+1)
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			workerAddr := wp.IP
+
+			// Send the tuple via RPC - Leader provides its IP for ack-back
+			args := rss.AddTuplesArgs{
+				TaskID:     taskID,
+				Tuples:     []rss.Tuple{tuple},
+				SourceIP:   leaderIP, // Leader's IP so workers can ack back
+				SourceTask: -1,       // -1 indicates this is from the leader/source
+			}
+			var reply bool
+			if err := sendRPC(workerAddr, "Worker.AddTuples", &args, &reply); err != nil {
+				log.Printf("failed to send tuple to worker %s task %d: %v (attempt %d)", workerAddr, taskID, err, attempt+1)
+				time.Sleep(50 * time.Millisecond)
+				continue // Retry with fresh task list
+			}
+
+			// Success - record and break
+			l.sentMu.Lock()
+			l.sentTuples[tupleID] = tuple
+			l.sentTask[tupleID] = taskID
+			l.sentMu.Unlock()
+			break
 		}
-
-		idx := int(rss.HashKey(tuple.Key)) % len(stage1IDs)
-		taskID := stage1IDs[idx]
-
-		l.mu.Lock()
-		wp, ok := l.taskMapping[taskID]
-		l.mu.Unlock()
-		if !ok {
-			return fmt.Errorf("no worker assigned for task %d", taskID)
-		}
-		workerAddr := wp.IP
-
-		// Send the tuple via RPC - Leader provides its IP for ack-back
-		args := rss.AddTuplesArgs{
-			TaskID:     taskID,
-			Tuples:     []rss.Tuple{tuple},
-			SourceIP:   leaderIP, // Leader's IP so workers can ack back
-			SourceTask: -1,       // -1 indicates this is from the leader/source
-		}
-		var reply bool
-		if err := sendRPC(workerAddr, "Worker.AddTuples", &args, &reply); err != nil {
-			fmt.Printf("failed to send tuple to worker %s task %d: %v\n", workerAddr, taskID, err)
-			// optionally buffer for retry
-		}
-
-		// Record that leader sent this tuple so we can resend until acked (keyed by TupleID)
-		l.sentMu.Lock()
-		l.sentTuples[tupleID] = tuple
-		l.sentTask[tupleID] = taskID
-		l.sentMu.Unlock()
 
 		lineNum++
 	}
