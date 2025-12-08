@@ -385,6 +385,43 @@ func (w *Worker) UpdateDownstream(args *rss.UpdateDownstreamArgs, reply *bool) e
 	return nil
 }
 
+// AddDownstream appends a new downstream task to this task's downstream list
+func (w *Worker) AddDownstream(args *rss.AddDownstreamArgs, reply *bool) error {
+	tasksMu.Lock()
+	defer tasksMu.Unlock()
+
+	ts, ok := tasks[args.TaskID]
+	if !ok {
+		return fmt.Errorf("task %d not found", args.TaskID)
+	}
+
+	ts.Downstream = append(ts.Downstream, args.Downstream)
+	*reply = true
+	return nil
+}
+
+// RemoveDownstream removes a downstream task by TaskID from this task's downstream list
+func (w *Worker) RemoveDownstream(args *rss.RemoveDownstreamArgs, reply *bool) error {
+	tasksMu.Lock()
+	defer tasksMu.Unlock()
+
+	ts, ok := tasks[args.TaskID]
+	if !ok {
+		return fmt.Errorf("task %d not found", args.TaskID)
+	}
+
+	// Find and remove the downstream entry with matching TaskID
+	newDownstream := make([]rss.DownstreamInfo, 0, len(ts.Downstream))
+	for _, ds := range ts.Downstream {
+		if ds.TaskID != args.DownstreamTaskID {
+			newDownstream = append(newDownstream, ds)
+		}
+	}
+	ts.Downstream = newDownstream
+	*reply = true
+	return nil
+}
+
 // Main processing goroutine - reads from queue, processes, acks, and forwards
 func processTuples(ts *TaskState) {
 	// Create a scanner to read from stdout

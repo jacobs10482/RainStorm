@@ -61,6 +61,18 @@ type UpdateDownstreamArgs struct {
 	Downstream      DownstreamInfo
 }
 
+// AddDownstreamArgs appends a new downstream task to an upstream task
+type AddDownstreamArgs struct {
+	TaskID     int            // upstream task to update
+	Downstream DownstreamInfo // new downstream to add
+}
+
+// RemoveDownstreamArgs removes a downstream task from an upstream task
+type RemoveDownstreamArgs struct {
+	TaskID           int // upstream task to update
+	DownstreamTaskID int // downstream task ID to remove
+}
+
 type TaskIPAndPID struct {
 	IP  string
 	PID int

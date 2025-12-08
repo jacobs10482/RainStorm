@@ -243,13 +243,29 @@ func (l *Leader) addTaskToStage(stage int) error {
 	l.mu.Lock()
 	l.taskMapping[newTaskID] = rss.TaskIPAndPID{IP: worker, PID: reply}
 	l.activeTasks[stage] = append(l.activeTasks[stage], newTaskID)
-	l.mu.Unlock()
 
-	// Update upstream tasks with new downstream
+	// Notify upstream tasks about the new downstream (only if not first stage)
 	if stage > 0 {
-		if err := l.updateUpstreamDownstreams(stage); err != nil {
-			log.Printf("addTaskToStage: failed to update upstream for stage %d: %v", stage, err)
+		upstreamIDs := append([]int(nil), l.activeTasks[stage-1]...)
+		upstreamWorkers := make(map[int]string)
+		for _, tid := range upstreamIDs {
+			if wp, ok := l.taskMapping[tid]; ok {
+				upstreamWorkers[tid] = wp.IP
+			}
 		}
+		l.mu.Unlock()
+
+		// Send AddDownstream to each upstream task (one RPC per upstream)
+		newDS := rss.DownstreamInfo{TaskID: newTaskID, IP: worker}
+		for tid, workerIP := range upstreamWorkers {
+			var reply bool
+			args := &rss.AddDownstreamArgs{TaskID: tid, Downstream: newDS}
+			if err := sendRPC(workerIP, "Worker.AddDownstream", args, &reply); err != nil {
+				log.Printf("addTaskToStage: failed to add downstream to task %d: %v", tid, err)
+			}
+		}
+	} else {
+		l.mu.Unlock()
 	}
 
 	log.Printf("addTaskToStage: added task %d to stage %d on worker %s", newTaskID, stage, worker)
@@ -286,10 +302,25 @@ func (l *Leader) removeTaskFromStage(stage int) error {
 	delete(l.metricsPerTask, taskToRemove)
 	l.metricsMu.Unlock()
 
-	// Update upstream tasks with new downstream list (without the removed task)
+	// Notify upstream tasks to remove this downstream (only if not first stage)
 	if stage > 0 {
-		if err := l.updateUpstreamDownstreams(stage); err != nil {
-			log.Printf("removeTaskFromStage: failed to update upstream for stage %d: %v", stage, err)
+		l.mu.Lock()
+		upstreamIDs := append([]int(nil), l.activeTasks[stage-1]...)
+		upstreamWorkers := make(map[int]string)
+		for _, tid := range upstreamIDs {
+			if wpp, ok := l.taskMapping[tid]; ok {
+				upstreamWorkers[tid] = wpp.IP
+			}
+		}
+		l.mu.Unlock()
+
+		// Send RemoveDownstream to each upstream task (one RPC per upstream)
+		for tid, workerIP := range upstreamWorkers {
+			var reply bool
+			args := &rss.RemoveDownstreamArgs{TaskID: tid, DownstreamTaskID: taskToRemove}
+			if err := sendRPC(workerIP, "Worker.RemoveDownstream", args, &reply); err != nil {
+				log.Printf("removeTaskFromStage: failed to remove downstream from task %d: %v", tid, err)
+			}
 		}
 	}
 
