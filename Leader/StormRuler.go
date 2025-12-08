@@ -106,7 +106,62 @@ func (l *Leader) AckTuple(args *rss.TupleOutputArgs, reply *bool) error {
 	*reply = true
 	return nil
 }
+// Add this to stormruler.go
 
+func (l *Leader) handleSaveLogs() {
+    // 1. Create the local directory
+    dir := "../log_files"
+    // 1. WIPE the existing directory (if it exists) to ensure a clean slate
+    fmt.Println("Cleaning up old log files...")
+    if err := os.RemoveAll(dir); err != nil {
+        fmt.Printf("Error cleaning up directory '%s': %v\n", dir, err)
+        return
+    }
+
+    // 2. Create the directory fresh
+    if err := os.MkdirAll(dir, 0755); err != nil {
+        fmt.Printf("Error creating directory '%s': %v\n", dir, err)
+        return
+    }
+
+    l.mu.Lock()
+    maxID := l.nextTaskID
+    l.mu.Unlock()
+
+    fmt.Printf("Fetching logs for %d total tasks into './%s'...\n", maxID, dir)
+
+    var wg sync.WaitGroup
+    
+    // 2. Iterate through ALL Task IDs that have ever existed
+    for i := 0; i < maxID; i++ {
+        wg.Add(1)
+        go func(tid int) {
+            defer wg.Done()
+
+            // Define HyDFS filenames
+            procLog := fmt.Sprintf("processed_tuples_%d.log", tid)
+            ackLog := fmt.Sprintf("acked_tuples_%d.log", tid)
+
+            // Define Local destination paths
+            localProc := fmt.Sprintf("%s/%s", dir, procLog)
+            localAck := fmt.Sprintf("%s/%s", dir, ackLog)
+
+            // 3. Fetch from HyDFS
+            // We ignore errors here because some tasks might not have written logs yet
+            // or might not have needed an ack log.
+            
+            // Get Processed Log
+            hydfs.HandleGet(node, procLog, localProc)
+                
+
+            // Get Acked Log
+            hydfs.HandleGet(node, ackLog, localAck)
+        }(i)
+    }
+
+    wg.Wait()
+    fmt.Println("Finished saving logs.")
+}
 // ReportMetrics receives per-task input rate metrics from workers.
 func (l *Leader) ReportMetrics(args *rss.MetricsArgs, reply *bool) error {
 	l.metricsMu.Lock()
@@ -1071,8 +1126,10 @@ func main() {
 		case "list_tasks":
 			leader.handleListTasks()
 			continue
+		case "save_logs":
+			leader.handleSaveLogs()
+			continue
 		}
-
 		// Check if it's a hydfs command
 		if hydfs.HydfsResponder(node, line) {
 			continue
