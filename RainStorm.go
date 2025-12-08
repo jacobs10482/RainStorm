@@ -224,10 +224,8 @@ func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *int) error {
 		go func() {
 			_ = ts.Cmd.Wait()
 			// notify via FailureChan to stop processing goroutines
-			select {
-			case ts.FailureChan <- fmt.Errorf("process exited"):
-			default:
-			}
+			// broadcast close to all
+			close(ts.FailureChan)
 			// cleanup
 			tasksMu.Lock()
 			delete(tasks, ts.ID)
@@ -266,7 +264,9 @@ func monitorTaskFailure(ts *TaskState) {
 	// Wait for the command to finish
 	err := ts.Cmd.Wait()
 
-	ts.FailureChan <- err
+	// Close the channel to broadcast failure to ALL listening goroutines (processTuples, monitorAcks)
+	// Sending a single value only wakes one of them, leaving the other running on stale state (zombie).
+	close(ts.FailureChan)
 
 	if err != nil {
 		log.Printf("task %d process exited with error: %v\n", ts.ID, err)
