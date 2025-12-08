@@ -97,7 +97,10 @@ type Leader struct {
 // --------------------------
 
 func (l *Leader) AckTuple(args *rss.TupleOutputArgs, reply *bool) error {
-	// Leader receives acks from first stage tasks, keyed by TupleID
+	// Leader receives ack notifications from stage-1 tasks.
+	// This method records the acked tuple in `ackedTuples` so the
+	// leader's resend logic (`monitorSent`) can stop resending it.
+	// Lock `ackedMu` for writing while updating the shared map.
 	l.ackedMu.Lock()
 	l.ackedTuples[args.Tuple.TupleID] = args.Tuple
 	l.ackedMu.Unlock()
@@ -106,62 +109,63 @@ func (l *Leader) AckTuple(args *rss.TupleOutputArgs, reply *bool) error {
 	*reply = true
 	return nil
 }
+
 // Add this to stormruler.go
 
 func (l *Leader) handleSaveLogs() {
-    // 1. Create the local directory
-    dir := "../log_files"
-    // 1. WIPE the existing directory (if it exists) to ensure a clean slate
-    fmt.Println("Cleaning up old log files...")
-    if err := os.RemoveAll(dir); err != nil {
-        fmt.Printf("Error cleaning up directory '%s': %v\n", dir, err)
-        return
-    }
+	// 1. Create the local directory
+	dir := "../log_files"
+	// 1. WIPE the existing directory (if it exists) to ensure a clean slate
+	fmt.Println("Cleaning up old log files...")
+	if err := os.RemoveAll(dir); err != nil {
+		fmt.Printf("Error cleaning up directory '%s': %v\n", dir, err)
+		return
+	}
 
-    // 2. Create the directory fresh
-    if err := os.MkdirAll(dir, 0755); err != nil {
-        fmt.Printf("Error creating directory '%s': %v\n", dir, err)
-        return
-    }
+	// 2. Create the directory fresh
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		fmt.Printf("Error creating directory '%s': %v\n", dir, err)
+		return
+	}
 
-    l.mu.Lock()
-    maxID := l.nextTaskID
-    l.mu.Unlock()
+	l.mu.Lock()
+	maxID := l.nextTaskID
+	l.mu.Unlock()
 
-    fmt.Printf("Fetching logs for %d total tasks into './%s'...\n", maxID, dir)
+	fmt.Printf("Fetching logs for %d total tasks into './%s'...\n", maxID, dir)
 
-    var wg sync.WaitGroup
-    
-    // 2. Iterate through ALL Task IDs that have ever existed
-    for i := 0; i < maxID; i++ {
-        wg.Add(1)
-        go func(tid int) {
-            defer wg.Done()
+	var wg sync.WaitGroup
 
-            // Define HyDFS filenames
-            procLog := fmt.Sprintf("processed_tuples_%d.log", tid)
-            ackLog := fmt.Sprintf("acked_tuples_%d.log", tid)
+	// 2. Iterate through ALL Task IDs that have ever existed
+	for i := 0; i < maxID; i++ {
+		wg.Add(1)
+		go func(tid int) {
+			defer wg.Done()
 
-            // Define Local destination paths
-            localProc := fmt.Sprintf("%s/%s", dir, procLog)
-            localAck := fmt.Sprintf("%s/%s", dir, ackLog)
+			// Define HyDFS filenames
+			procLog := fmt.Sprintf("processed_tuples_%d.log", tid)
+			ackLog := fmt.Sprintf("acked_tuples_%d.log", tid)
 
-            // 3. Fetch from HyDFS
-            // We ignore errors here because some tasks might not have written logs yet
-            // or might not have needed an ack log.
-            
-            // Get Processed Log
-            hydfs.HandleGet(node, procLog, localProc)
-                
+			// Define Local destination paths
+			localProc := fmt.Sprintf("%s/%s", dir, procLog)
+			localAck := fmt.Sprintf("%s/%s", dir, ackLog)
 
-            // Get Acked Log
-            hydfs.HandleGet(node, ackLog, localAck)
-        }(i)
-    }
+			// 3. Fetch from HyDFS
+			// We ignore errors here because some tasks might not have written logs yet
+			// or might not have needed an ack log.
 
-    wg.Wait()
-    fmt.Println("Finished saving logs.")
+			// Get Processed Log
+			hydfs.HandleGet(node, procLog, localProc)
+
+			// Get Acked Log
+			hydfs.HandleGet(node, ackLog, localAck)
+		}(i)
+	}
+
+	wg.Wait()
+	fmt.Println("Finished saving logs.")
 }
+
 // ReportMetrics receives per-task input rate metrics from workers.
 func (l *Leader) ReportMetrics(args *rss.MetricsArgs, reply *bool) error {
 	l.metricsMu.Lock()

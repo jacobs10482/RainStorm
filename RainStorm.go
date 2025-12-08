@@ -154,6 +154,12 @@ func loadStateFromHyDFS(logFilename string) (map[string]rss.Tuple, error) {
 }
 
 func (w *Worker) AssignTask(args *rss.AssignTaskArgs, reply *int) error {
+	// AssignTask starts the operator process for a task and restores any
+	// recovered state from HyDFS. It initializes the TaskState, starts the
+	// processing goroutine (`processTuples`) and any monitoring goroutines.
+	// - This function intentionally does not block long-running work.
+	// - It recovers `ProcessedTuples` and `AckedTuples` from HyDFS so the
+	//   worker can resume exactly-once delivery semantics.
 	tasksMu.Lock()
 	defer tasksMu.Unlock()
 
@@ -261,6 +267,11 @@ func (w *Worker) GetTaskStatus(args *rss.GetTaskStatusArgs, reply *rss.GetTaskSt
 	return nil
 }
 func monitorTaskFailure(ts *TaskState) {
+	// monitorTaskFailure watches the operator process. When the process
+	// exits (normally or via error) it closes the failure channel to
+	// notify other goroutines (processTuples, monitorAcks) and informs the
+	// leader via `Leader.TaskFailed` so the leader can revive the task.
+	// Closing `FailureChan` is used as a broadcast to all waiting goroutines.
 	// Wait for the command to finish
 	err := ts.Cmd.Wait()
 
@@ -295,6 +306,11 @@ func monitorTaskFailure(ts *TaskState) {
 }
 
 func monitorAcks(ts *TaskState) {
+	// monitorAcks periodically scans the worker's processed-but-unacked
+	// map and resends outputs to downstream tasks until they are acked.
+	// It makes a snapshot of unacked items to avoid holding locks while
+	// performing RPCs. `ProcessedTuples` is keyed by input TupleID and
+	// stores the output tuple emitted for that input.
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -453,6 +469,11 @@ func (w *Worker) UpdateDownstreamByTaskID(args *rss.UpdateDownstreamByTaskIDArgs
 
 // Main processing goroutine - reads from queue, processes, acks, and forwards
 func processTuples(ts *TaskState) {
+	// processTuples is the main per-task loop: it reads input tuples from
+	// `InputQueue`, writes them to the operator's stdin, reads operator
+	// output, records processed/acked state (for exactly-once), and
+	// forwards outputs to downstream tasks. It must be efficient and
+	// careful about lock usage to avoid blocking metrics/ack monitors.
 	// Create a scanner to read from stdout
 	scanner := bufio.NewScanner(ts.Stdout)
 
@@ -602,6 +623,9 @@ func processTuples(ts *TaskState) {
 }
 
 func sendAck(sourceIP string, sourceTaskID int, tuple rss.Tuple) {
+	// sendAck is used by workers to send acknowledgement messages back to
+	// the source of a tuple (either another worker or the leader). The
+	// function selects the correct RPC method based on `sourceTaskID`.
 	if sourceIP == "" {
 		// No upstream source
 		return
@@ -631,6 +655,10 @@ func sendAck(sourceIP string, sourceTaskID int, tuple rss.Tuple) {
 }
 
 func (w *Worker) AckTuple(args *rss.TupleOutputArgs, reply *bool) error {
+	// AckTuple is called by downstream workers (or leader) to acknowledge
+	// delivery of an output tuple. The worker records the ack in
+	// `AckedTuples` (keyed by TupleID) and persists it to HyDFS so that
+	// monitorAcks can stop resending already-acked items.
 	tasksMu.Lock()
 	ts, ok := tasks[args.TaskID]
 	tasksMu.Unlock()
@@ -654,6 +682,8 @@ func (w *Worker) AckTuple(args *rss.TupleOutputArgs, reply *bool) error {
 }
 
 func (w *Worker) AddTuples(args *rss.AddTuplesArgs, reply *bool) error {
+	// AddTuples enqueues received tuples into the task's `InputQueue`.
+	// This is the main ingress point for tuples at each worker.
 	tasksMu.Lock()
 	ts, ok := tasks[args.TaskID]
 	tasksMu.Unlock()
@@ -678,6 +708,11 @@ func (w *Worker) AddTuples(args *rss.AddTuplesArgs, reply *bool) error {
 }
 
 func (w *Worker) KillTask(args *rss.KillTaskArgs, reply *bool) error {
+	// KillTask forcibly terminates a task: removes it from the local map,
+	// closes its input queue (to stop processing), and kills the operator
+	// process. This is used by the leader when it wants the worker to
+	// stop immediately. Prefer graceful drain via GetQueueLen before
+	// calling KillTask when possible.
 	tasksMu.Lock()
 	ts, ok := tasks[args.TaskID]
 	if ok {
@@ -702,6 +737,9 @@ func (w *Worker) KillTask(args *rss.KillTaskArgs, reply *bool) error {
 
 // GetQueueLen returns the current length of the input queue for the given task.
 func (w *Worker) GetQueueLen(args *rss.GetQueueLenArgs, reply *rss.QueueLenReply) error {
+	// GetQueueLen is a lightweight RPC to let the leader poll how many
+	// tuples are still queued for a task. It intentionally only returns
+	// the current buffered length of the `InputQueue` channel.
 	tasksMu.Lock()
 	ts, ok := tasks[args.TaskID]
 	tasksMu.Unlock()
