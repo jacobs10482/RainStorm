@@ -9,12 +9,13 @@ import (
 
 func main() {
 
-	if len(os.Args) != 2 {
+	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "Usage: ./filter <pattern>")
 		os.Exit(1)
 	}
 
-	rawPattern := os.Args[1]
+	// Join all arguments to handle cases where AssignTask splits "Street Name" into multiple args
+	rawPattern := strings.Join(os.Args[1:], " ")
 	pattern := strings.Trim(rawPattern, "\"\u201c\u201d")
 
 	scanner := bufio.NewScanner(os.Stdin)
