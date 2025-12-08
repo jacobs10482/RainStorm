@@ -447,19 +447,16 @@ func (l *Leader) TaskFailed(args *rss.ReviveTaskArgs, reply *bool) error {
 	prevStage := arg.Stage - 1
 	upstreamIDs := append([]int(nil), l.activeTasks[prevStage]...)
 
-	// Find which index in downstream the revived task should occupy
-	currentStageIDs := l.activeTasks[arg.Stage]
-	downstreamIndex := -1
-	for i, tid := range currentStageIDs {
+	// Ensure this task is in activeTasks for this stage
+	found := false
+	for _, tid := range l.activeTasks[arg.Stage] {
 		if tid == arg.TaskID {
-			downstreamIndex = i
+			found = true
 			break
 		}
 	}
-	if downstreamIndex == -1 {
-		// Task not in activeTasks yet for this stage, add it
+	if !found {
 		l.activeTasks[arg.Stage] = append(l.activeTasks[arg.Stage], arg.TaskID)
-		downstreamIndex = len(l.activeTasks[arg.Stage]) - 1
 	}
 
 	// collect upstream worker addresses while holding lock
@@ -475,16 +472,16 @@ func (l *Leader) TaskFailed(args *rss.ReviveTaskArgs, reply *bool) error {
 	l.mu.Unlock()
 
 	// Step 4: notify upstream tasks (do RPCs without holding leader lock)
-	// Build downstream info for the revived task
-	downstreamInfo := rss.DownstreamInfo{TaskID: arg.TaskID, IP: worker}
+	// Update downstream entry by TaskID (finds and updates, or adds if not found)
+	newDownstreamInfo := rss.DownstreamInfo{TaskID: arg.TaskID, IP: worker}
 	for upstreamTaskID, upstreamWorkerIP := range upstreamWorkers {
 		var updateReply bool
-		args2 := &rss.UpdateDownstreamArgs{
-			TaskID:          upstreamTaskID,
-			DownstreamIndex: downstreamIndex,
-			Downstream:      downstreamInfo,
+		args2 := &rss.UpdateDownstreamByTaskIDArgs{
+			TaskID:           upstreamTaskID,
+			DownstreamTaskID: arg.TaskID,
+			NewDownstream:    newDownstreamInfo,
 		}
-		if err := sendRPC(upstreamWorkerIP, "Worker.UpdateDownstream", args2, &updateReply); err != nil {
+		if err := sendRPC(upstreamWorkerIP, "Worker.UpdateDownstreamByTaskID", args2, &updateReply); err != nil {
 			return fmt.Errorf("failed to update upstream task %d on %s: %v", upstreamTaskID, upstreamWorkerIP, err)
 		}
 		if !updateReply {

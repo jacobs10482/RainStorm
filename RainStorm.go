@@ -422,6 +422,35 @@ func (w *Worker) RemoveDownstream(args *rss.RemoveDownstreamArgs, reply *bool) e
 	return nil
 }
 
+// UpdateDownstreamByTaskID finds a downstream entry by TaskID and updates it (for revival)
+func (w *Worker) UpdateDownstreamByTaskID(args *rss.UpdateDownstreamByTaskIDArgs, reply *bool) error {
+	tasksMu.Lock()
+	defer tasksMu.Unlock()
+
+	ts, ok := tasks[args.TaskID]
+	if !ok {
+		return fmt.Errorf("task %d not found", args.TaskID)
+	}
+
+	// Find and update the downstream entry with matching TaskID
+	found := false
+	for i, ds := range ts.Downstream {
+		if ds.TaskID == args.DownstreamTaskID {
+			ts.Downstream[i] = args.NewDownstream
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		// Task wasn't in downstream list, add it
+		ts.Downstream = append(ts.Downstream, args.NewDownstream)
+	}
+
+	*reply = true
+	return nil
+}
+
 // Main processing goroutine - reads from queue, processes, acks, and forwards
 func processTuples(ts *TaskState) {
 	// Create a scanner to read from stdout
@@ -537,9 +566,15 @@ func processTuples(ts *TaskState) {
 			idx := int(HashKey(outputTuple.Key)) % len(ts.Downstream)
 			target := ts.Downstream[idx]
 
-			// Forward with retry logic (limited retries with backoff)
+			// Forward with retry logic
+			// For exactly_once: retry forever (with backoff) to ensure delivery
+			// For non-exactly_once: limited retries then give up
 			maxRetries := 10
-			for attempt := 0; attempt < maxRetries; attempt++ {
+			if ts.TaskArgs.Exactly_Once {
+				maxRetries = -1 // infinite retries
+			}
+
+			for attempt := 0; maxRetries < 0 || attempt < maxRetries; attempt++ {
 				var dummyReply bool
 				err := sendRPC(target.IP, "Worker.AddTuples",
 					&rss.AddTuplesArgs{
@@ -559,7 +594,7 @@ func processTuples(ts *TaskState) {
 					break
 				}
 
-				log.Printf("Failed to forward tuple to %s (attempt %d/%d), retrying...", target.IP, attempt+1, maxRetries)
+				log.Printf("Failed to forward tuple to %s (attempt %d), retrying...", target.IP, attempt+1)
 				time.Sleep(100 * time.Millisecond) // backoff
 			}
 		}

@@ -73,6 +73,13 @@ type RemoveDownstreamArgs struct {
 	DownstreamTaskID int // downstream task ID to remove
 }
 
+// UpdateDownstreamByTaskIDArgs updates a downstream entry by its TaskID (for revival)
+type UpdateDownstreamByTaskIDArgs struct {
+	TaskID           int            // upstream task to update
+	DownstreamTaskID int            // downstream task ID to find and update
+	NewDownstream    DownstreamInfo // new info (same TaskID, new IP)
+}
+
 type TaskIPAndPID struct {
 	IP  string
 	PID int
