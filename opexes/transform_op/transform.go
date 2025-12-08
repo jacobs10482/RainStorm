@@ -50,6 +50,7 @@ func main() {
 		// Output transformed tuple
 		newValue := fmt.Sprintf("%s,%s,%s", f1, f2, f3)
 		fmt.Printf("%s\t%s\n", key, newValue)
+		os.Stdout.Sync()
 	}
 
 	if err := scanner.Err(); err != nil {

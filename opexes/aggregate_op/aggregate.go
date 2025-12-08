@@ -32,5 +32,6 @@ func main() {
         counts[key] += countDelta
 
         fmt.Printf("%s\t%d\n", key, counts[key])
+		os.Stdout.Sync()
     }
 }

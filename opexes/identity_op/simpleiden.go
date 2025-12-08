@@ -19,6 +19,7 @@ func main() {
 		// Expect: key<tab>value
 		// Just output the same line.
 		fmt.Println(line)
+		os.Stdout.Sync()
 	}
 
 	if err := scanner.Err(); err != nil {

@@ -54,11 +54,12 @@ func main() {
 
             // 3. Output: <ExtractedKey, 1>
             fmt.Printf("%s\t1\n", extractedKey)
-            
+            os.Stdout.Sync()
         } else {
             // No Match: Unblock the worker
             fmt.Printf("%s\t__DROP__\n", originalKey)
+            os.Stdout.Sync()
         }
     }
-	
+
 }

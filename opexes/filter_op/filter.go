@@ -35,10 +35,12 @@ func main() {
 		if strings.Contains(value, pattern) {
 			// Output matched tuples as: key<TAB>value
 			fmt.Printf("%s\t%s\n", key, value)
+			os.Stdout.Sync()
 		} else {
 			// For non-matching (filtered-out) tuples, emit a special drop marker
 			// so the worker does not block waiting for operator output.
 			fmt.Printf("%s\t__DROP__\n", key)
+			os.Stdout.Sync()
 		}
 	}
 
