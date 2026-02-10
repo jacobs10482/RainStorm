@@ -1,4 +1,4 @@
-# CS425 MP4: RainStorm Stream Processing Framework
+RainStorm Stream Processing Framework
 
 ## Overview
 
